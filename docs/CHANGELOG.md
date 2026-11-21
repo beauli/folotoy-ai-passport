@@ -10,6 +10,12 @@
 > with `CHANGELOG.zh_CN.md`. The entries currently under `Unreleased` are pending
 > review for the next release; they are not a finalized release history.
 
+## v1.2.0-peashooter-lawn-defense - 2026-11-21
+
+- Added **Peashooter Lawn Defense**, an offline arcade app that now replaces the demo menu at boot. Three keys only: up moves left, down moves right, holding either for about half a second doubles movement speed, and OK pauses. Peas fire upward on their own, so the whole game is footwork — line the shooter up with a column and never let a zombie cross the bottom line. Ten HP and three lives, levels advance every 1000 points, the pea gun upgrades itself at levels 1/3/5/7/9 from a single lazy pea to a railgun that pierces a whole column, and falling gifts double the fire rate for 20 seconds or add one pea per volley up to a hard four. Missing a gift costs nothing. The best score is stored in non-volatile storage and survives a restart.
+
+- Turned that app into an endless run and made the gifts risky to chase. Difficulty now advances in four 10-level tiers at x1/x2/x4/x6 HP and spawn density instead of stopping at level 10, so the win screen and its medal are gone: a run ends only when the three lives are gone, and the lawn recolours per tier so the step-up is visible. A third gift, the clone card, plants three staggered clone shooters along the bottom edge for the rest of the life, but after a 10-second grace it arms a 20-second backlash in which zombies spawn a clone every three seconds; an uncaught clone card can also be stolen mid-air by an adult zombie at a tier-scaled chance, rolled once per card, which splits a clone on the spot and opens a shorter copy window for the others. Zombie clones are worth half the HP and half the score of their parent. Storage now holds a record — best score plus furthest level — written once per new furthest level and once at game over rather than on every kill, and every boot starts at level 1. The LVGL memory pool grew from 32 KB to 48 KB for the larger object count.
+
 ## Unreleased
 
 - Added the supplied 80-byte CW2017 profile for the specified 520 mAh cell, including content/update-flag checks, verified writes, the required restart sequence, and bounded SOC-readiness polling.
