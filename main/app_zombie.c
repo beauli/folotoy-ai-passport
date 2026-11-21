@@ -53,9 +53,6 @@ static const char *TAG = "z_app";
 #define COL_TEXT      0xF2F7DF
 #define COL_DIM       0xB2C497
 #define COL_GOLD      0xFFD928
-#define COL_MEDAL_DK  0xC8981C      // 奖章中心那一圈压深的金
-#define COL_MEDAL_SILVER 0xC9D2DA   // 通关奖章另外两档:只剩 2 条命是银
-#define COL_MEDAL_BRONZE 0xC0783C   // 丢过两条以上的人拿铜,配色故意暗一档
 #define COL_POT       0xC0693A      // 花盆
 #define COL_POT_RIM   0x9C4F27
 #define COL_STALK     0x2F6B22      // 茎与叶背:比草坪深一档,免得糊在草里
@@ -120,6 +117,9 @@ typedef struct {
 
 static zg_game_t s_game;
 static uint32_t s_best_at_boot;      // 本次开机时的纪录快照,用来判断"这局正在破纪录"
+// 内存里的纪录镜像:最高分和最远关卡。换关时先在内存比对,真的涨了才写一次盘,
+// 所以"第 5 关重打到第 5 关"不会重复写同一格 Flash。
+static zombie_save_t s_rec;
 static bool s_nvs_ok = true;
 
 static lv_obj_t *s_scr;
@@ -141,11 +141,6 @@ static lv_obj_t *s_lawn_b;
 static lv_obj_t *s_level_bar;
 static lv_obj_t *s_level_label;
 static lv_obj_t *s_level_sub;
-static lv_obj_t *s_win_label;
-static lv_obj_t *s_win_sub;
-static lv_obj_t *s_medal;
-static lv_obj_t *s_medal_disc;   // 金/银/铜只换这一圈的颜色
-static lv_obj_t *s_medal_label;
 static lv_obj_t *s_player;
 static lv_obj_t *s_leaf_l;
 static lv_obj_t *s_leaf_r;
@@ -162,7 +157,6 @@ static uint8_t s_lawn_shown = 0xFF;
 // 横幅文字同理:记录上一次写的是哪一条(-1 = 没亮)。界面是每次 start 新建的,
 // 所以 ui_build 里要把它打回 -1,否则重建后第一条横幅会被当成"没变化"而漏写。
 static int8_t s_banner_shown = -1;
-static bool s_win_logged;   // 通关日志只打一次,重开时清掉
 
 static lv_timer_t *s_timer;
 static QueueHandle_t s_keys;
@@ -415,22 +409,6 @@ static void ui_build(void)
     s_level_sub = add_label(s_level_bar, 0, 32, &lv_font_montserrat_14, COL_TEXT,
                             LV_TEXT_ALIGN_CENTER, ZG_FIELD_W);
     lv_obj_align(s_level_sub, LV_ALIGN_TOP_MID, 0, 32);
-    // 通关画面:恭喜 + 一行说明 + 分数,再下面是一枚奖章(缎带 + 金盘 + 压深中心),
-    // 奖章下面一行写清楚拿到的是哪一档、凭什么。
-    s_win_label = add_label(s_field, 0, 52, &lv_font_montserrat_20, COL_GOLD,
-                            LV_TEXT_ALIGN_CENTER, ZG_FIELD_W);
-    lv_obj_align(s_win_label, LV_ALIGN_TOP_MID, 0, 52);
-    s_win_sub = add_label(s_field, 0, 78, &lv_font_montserrat_14, COL_TEXT,
-                          LV_TEXT_ALIGN_CENTER, ZG_FIELD_W);
-    lv_obj_align(s_win_sub, LV_ALIGN_TOP_MID, 0, 78);
-    s_medal = add_box(s_field, 100, 120, 40, 48, COL_BG, 0);
-    lv_obj_set_style_bg_opa(s_medal, LV_OPA_TRANSP, 0);
-    add_box(s_medal, 13, 0, 14, 18, COL_HP, 1);            // 缎带
-    s_medal_disc = add_box(s_medal, 5, 14, 30, 30, COL_GOLD, LV_RADIUS_CIRCLE);   // 金盘
-    add_box(s_medal, 14, 23, 12, 12, COL_MEDAL_DK, LV_RADIUS_CIRCLE);
-    s_medal_label = add_label(s_field, 0, 176, &lv_font_montserrat_14, COL_GOLD,
-                              LV_TEXT_ALIGN_CENTER, ZG_FIELD_W);
-    lv_obj_align(s_medal_label, LV_ALIGN_TOP_MID, 0, 176);
     set_visible(s_ready_label, false);
     s_banner_shown = -1;   // 横幅是新建的对象,上一局的"已经写过哪条"不算数
     set_visible(s_banner, false);
@@ -438,10 +416,6 @@ static void ui_build(void)
     set_visible(s_over_label, false);
     set_visible(s_over_score, false);
     set_visible(s_level_bar, false);
-    set_visible(s_win_label, false);
-    set_visible(s_win_sub, false);
-    set_visible(s_medal, false);
-    set_visible(s_medal_label, false);
 
     s_footer = add_label(s_scr, UI_EDGE_X, UI_FOOTER_Y, &lv_font_montserrat_14, COL_DIM,
                          LV_TEXT_ALIGN_CENTER, UI_TEXT_W);
@@ -453,9 +427,11 @@ static void ui_build(void)
 // 外观签名:只有它变了才重设尺寸与配色,每帧都改样式会把渲染压成橡皮图章。
 static int16_t zombie_look(const zg_zombie_t *z)
 {
-    return (int16_t)((int)z->type * 16 + (z->airborne ? 8 : 0) +
+    // 一个特征占一位,所以 type 的步长必须大于下面所有位的总和:加进"抢过卡片"
+    // 之后仍留到第 4 位,步长从 16 抬到 32,否则大僵尸的 carded 会撞成小僵尸的 flash。
+    return (int16_t)((int)z->type * 32 + (z->airborne ? 8 : 0) +
                      (z->telegraph_ms > 0 ? 4 : 0) + (z->flash_ms > 0 ? 2 : 0) +
-                     (z->is_clone ? 1 : 0));
+                     (z->carded ? 16 : 0) + (z->is_clone ? 1 : 0));
 }
 
 static void zview_apply(zview_t *v, const zg_zombie_t *z)
@@ -501,10 +477,13 @@ static void zview_apply(zview_t *v, const zg_zombie_t *z)
     lv_obj_set_size(v->arm_r, arm_w, arm_h);
     lv_obj_set_style_bg_color(v->arm_r, lv_color_hex(arm_col), 0);
     lv_obj_set_style_bg_opa(v->arm_r, opa, 0);
-    lv_obj_set_style_border_width(v->box, (air || dup) ? 1 : 0, 0);
-    lv_obj_set_style_border_color(v->box, lv_color_hex(dup ? zg_item_info(ZG_ITEM_CLONE)->color
-                                                           : 0x1A2A12), 0);
-    lv_obj_set_style_border_opa(v->box, dup ? LV_OPA_COVER : LV_OPA_50, 0);
+    // 抢过克隆卡片的那只描两圈卡片的紫(2px),分身只描 1px:同一圈紫,
+    // 粗细分得开"它复制出来的"和"它把卡片吃了",后者更该被盯住。
+    const bool stole = z->carded;
+    lv_obj_set_style_border_width(v->box, (air || dup || stole) ? (stole ? 2 : 1) : 0, 0);
+    lv_obj_set_style_border_color(v->box, lv_color_hex((dup || stole)
+                                ? zg_item_info(ZG_ITEM_CLONE)->color : 0x1A2A12), 0);
+    lv_obj_set_style_border_opa(v->box, (dup || stole) ? LV_OPA_COVER : LV_OPA_50, 0);
 }
 
 static void render_zombies(void)
@@ -614,6 +593,7 @@ static void render_fx(void)
     bool gun = false;
     bool clone = false;
     bool zlearn = false;
+    bool zeat = false;
     for (unsigned i = 0; i < ZG_POOL_FX; i++) {
         fxview_t *v = &s_fx_view[i];
         const zg_fx_t *fx = &s_game.fx[i];
@@ -654,6 +634,9 @@ static void render_fx(void)
         case ZG_FX_ZLEARN:
             // 坏消息抢好消息:同一帧里两条横幅都要亮时,先说僵尸学会了。
             zlearn = true; text_only = true; break;
+        case ZG_FX_ZEAT:
+            // 卡片被抢:比"僵尸学会了"更坏,因为它连"白拿一张卡"这件事都收回去了。
+            zeat = true; text_only = true; break;
         case ZG_FX_PICKUP:
             // 接到道具:一圈往外扩的白环,和"打死僵尸的灰绿粉"区分开。
             size = 10 + (int32_t)(18 * (100 - percent) / 100); color = 0xFFFFFF;
@@ -695,10 +678,14 @@ static void render_fx(void)
         v->look = (int16_t)fx->kind;
     }
 
-    const int8_t want = zlearn ? 2 : (clone ? 1 : (gun ? 0 : -1));
+    const int8_t want = zeat ? 3 : (zlearn ? 2 : (clone ? 1 : (gun ? 0 : -1)));
     if (want != s_banner_shown) {
         s_banner_shown = want;
-        if (want == 2) {
+        if (want == 3) {
+            // 卡片是僵尸抢的,不是玩家掉的:这一行决定玩家会不会去追下一张卡。
+            lv_label_set_text(s_banner, "ZOMBIE TOOK CARD!");
+            lv_obj_set_style_text_color(s_banner, lv_color_hex(COL_HP), 0);
+        } else if (want == 2) {
             lv_label_set_text(s_banner, "ZOMBIES CLONE!");
             lv_obj_set_style_text_color(s_banner, lv_color_hex(COL_HP), 0);
         } else if (want == 1) {
@@ -740,12 +727,16 @@ static void render_level(void)
     s_level_bar_on = true;
     s_level_shown = s_game.level;
     const zg_zombie_info_t *nz = zg_unlock_at(s_game.level);
+    const uint8_t mul = zg_tier_mul(s_game.level);
     lv_label_set_text_fmt(s_level_label, "LEVEL %u", (unsigned)s_game.level);
     if (nz) {
         lv_label_set_text_fmt(s_level_sub, "NEW: %s", nz->name);
-    } else if (s_game.level >= ZG_LEVEL_MAX) {
-        lv_label_set_text(s_level_sub, "MAX LEVEL");
+    } else if (mul > 1 && zg_tier_is_head(s_game.level)) {
+        // 阶梯起点:血量/刷怪密度按这个倍数整体往上跳,是唯一说得清"难在哪儿"的数字。
+        lv_label_set_text_fmt(s_level_sub, "TIER x%u ZOMBIES", (unsigned)mul);
     } else {
+        // 无尽段没有"最后一关":跨过 40 关之后倍数停在 ×6,但血还在往上涨,
+        // 所以这一行一直说"更硬了",不给终点感。
         lv_label_set_text(s_level_sub, "TOUGHER NOW");
     }
     set_visible(s_level_bar, true);
@@ -768,10 +759,16 @@ static void render_hud(void)
     lv_obj_set_width(s_hp_fill, (int32_t)s_game.hp * (UI_HP_W / ZG_HP_MAX));
     lv_label_set_text_fmt(s_lives, "x%u", (unsigned)s_game.lives);
 
-    // 级别写成分母形式(共 10 级),后面是这一级该拿到的枪档。
+    // 关卡没有分母(无尽,打多少关写多少关),后面是这一关该拿到的枪档。第二个阶梯起
+    // 再加一个难度倍数:同一把枪在 x4 阶梯打的是四倍厚的怪,不标出来会读成"枪没升"。
     const zg_weapon_info_t *w = zg_weapon_info(s_game.weapon);
-    lv_label_set_text_fmt(s_gun_label, "L%u/%u %s", (unsigned)s_game.level,
-                          (unsigned)ZG_LEVEL_MAX, w->name);
+    const uint8_t mul = zg_tier_mul(s_game.level);
+    if (mul > 1) {
+        lv_label_set_text_fmt(s_gun_label, "L%u x%u %s", (unsigned)s_game.level,
+                              (unsigned)mul, w->name);
+    } else {
+        lv_label_set_text_fmt(s_gun_label, "L%u %s", (unsigned)s_game.level, w->name);
+    }
 
     const int soc = s_soc_cache;
     lv_label_set_text_fmt(s_battery, (soc < 0) ? "--" : "%d%%", soc);
@@ -800,10 +797,6 @@ static void render_overlays(void)
     set_visible(s_ready_label, false);
     set_visible(s_over_label, false);
     set_visible(s_over_score, false);
-    set_visible(s_win_label, false);
-    set_visible(s_win_sub, false);
-    set_visible(s_medal, false);
-    set_visible(s_medal_label, false);
 
     // 按键卡只在这几屏出现:开局、暂停、结束——场上没有东西要看,才读得完。
     bool help = false;
@@ -813,8 +806,18 @@ static void render_overlays(void)
         lv_label_set_text(s_ready_label, s_game.paused ? "PAUSED" : "GET READY");
         set_visible(s_ready_label, true);
         help = true;
-        lv_label_set_text(s_footer, s_game.paused ? "TAP OK TO RESUME"
-                           : (s_nvs_ok ? "" : "NO STORAGE - SCORE NOT SAVED"));
+        if (s_game.paused) {
+            lv_label_set_text(s_footer, "TAP OK TO RESUME");
+        } else if (!s_nvs_ok) {
+            lv_label_set_text(s_footer, "NO STORAGE - SCORE NOT SAVED");
+        } else if (s_rec.level > 0) {
+            // 无尽模式没有"接着上次那关打":这一行说的是纪录,不是断点。
+            // 打完一局按重开回到这一屏,最远关卡和最高分就在这儿报给玩家。
+            lv_label_set_text_fmt(s_footer, "BEST L%u  %lu", (unsigned)s_rec.level,
+                                  (unsigned long)s_rec.best);
+        } else {
+            lv_label_set_text(s_footer, "");
+        }
         break;
     case ZG_PHASE_PLAY:
         if (s_game.paused) {
@@ -847,11 +850,17 @@ static void render_overlays(void)
                                   (unsigned)((s_game.rapid_ms + 999u) / 1000u));
         } else if (s_game.bonus_shots > 0) {
             lv_label_set_text_fmt(s_footer, "PEAS x%u", (unsigned)zg_volley(&s_game));
+        } else if (s_game.levelup_ms > 0 && s_nvs_ok && s_rec.level == s_game.level) {
+            // 换关横幅这 1.8 秒里,游戏任务已经把"最远到这一关"写进 Flash 了,顺手报一句。
+            // 重打已经过去的关卡时镜像比当前关卡高,这一行就不出现。
+            lv_label_set_text_fmt(s_footer, "RECORD  L%u  %lu", (unsigned)s_rec.level,
+                                  (unsigned long)s_rec.best);
         } else {
             lv_label_set_text(s_footer, "UP/DOWN MOVE  OK PAUSE");
         }
         break;
     case ZG_PHASE_OVER:
+        // 无尽模式没有"打完":三条命打空就是这一局的结论,画面只报分数与纪录。
         lv_label_set_text(s_over_label, "GAME OVER");
         lv_label_set_text_fmt(s_over_score, "SCORE %lu  KILLS %u",
                               (unsigned long)s_game.score, (unsigned)s_game.kills);
@@ -860,27 +869,8 @@ static void render_overlays(void)
         help = true;
         lv_label_set_text(s_footer, "PRESS LEFT OR RIGHT TO RETRY");
         break;
-    case ZG_PHASE_WIN:
-    default: {
-        // 奖励按还剩几条命定档:通关本身就够难,档位再高说明"一路没挨穿"。
-        const zg_medal_t medal = zg_medal_of(s_game.lives);
-        const uint32_t disc = (medal == ZG_MEDAL_GOLD) ? COL_GOLD :
-                              (medal == ZG_MEDAL_SILVER) ? COL_MEDAL_SILVER : COL_MEDAL_BRONZE;
-        lv_obj_set_style_bg_color(s_medal_disc, lv_color_hex(disc), 0);
-        lv_label_set_text(s_win_label, "CONGRATULATIONS!");
-        lv_label_set_text_fmt(s_win_sub, "ALL %u LEVELS CLEARED", (unsigned)ZG_LEVEL_MAX);
-        lv_label_set_text_fmt(s_over_score, "SCORE %lu  KILLS %u",
-                              (unsigned long)s_game.score, (unsigned)s_game.kills);
-        lv_label_set_text_fmt(s_medal_label, "%s MEDAL  %u LIVES LEFT",
-                              zg_medal_name(medal), (unsigned)s_game.lives);
-        set_visible(s_win_label, true);
-        set_visible(s_win_sub, true);
-        set_visible(s_over_score, true);
-        set_visible(s_medal, true);
-        set_visible(s_medal_label, true);
-        lv_label_set_text(s_footer, "PRESS LEFT OR RIGHT TO REPLAY");
+    default:
         break;
-    }
     }
     set_visible(s_help_label, help);
 }
@@ -992,38 +982,39 @@ static void game_task(void *arg)
         const int64_t now = now_us();
         const uint16_t dt = (uint16_t)((now - last) / 1000);
         last = now;
-        uint32_t save_best = 0;
-        bool need_save = false;
+        uint32_t rec_best = 0;
+        uint8_t rec_level = 0;
+        bool need_record = false;
 
         if (data_lock(200)) {
             if (want_restart) {
-                // 只有 GAME OVER / 通关时左右键才是重开;游玩中它仍然是移动,不吞按键。
-                if (zg_restart(&s_game)) s_win_logged = false;
+                // 只有 GAME OVER 时左右键才是重开;游玩中它仍然是移动,不吞按键。
+                // 重开拿当前纪录当比较基准,不然新局的"NEW HI"会跟一个过时的快照比。
+                if (zg_restart(&s_game)) s_best_at_boot = s_rec.best;
             }
             if (want_pause) zg_set_paused(&s_game, !s_game.paused);
             if (want_resume) zg_set_paused(&s_game, false);
             zg_set_keys(&s_game, left, right);
             zg_step(&s_game, dt);
-            if (s_game.phase == ZG_PHASE_WIN && !s_win_logged) {
-                // 通关只此一次,留一行日志:上板验收时这是唯一的客观凭据。
-                s_win_logged = true;
-                ESP_LOGI(TAG, "通关!%lus 打完 %u 关,分数 %lu,打死 %u 只,奖章 %s(剩 %u 命)",
-                         (unsigned long)(s_game.elapsed_ms / 1000u), (unsigned)ZG_LEVEL_MAX,
-                         (unsigned long)s_game.score, (unsigned)s_game.kills,
-                         zg_medal_name(zg_medal_of(s_game.lives)), (unsigned)s_game.lives);
-            }
-            if (s_game.best_dirty) {
-                save_best = s_game.best;
-                need_save = true;
-                s_game.best_dirty = false;   // 落盘在锁外做,标记已经接手
+            if (s_game.progress_dirty || s_game.best_dirty) {
+                // 引擎在换关和打死这两处招呼;写不写盘由纪录镜像说了算:
+                // 纪录只增不减,重打已经过去的关卡时这里两个数都不超,一次 Flash 也不写。
+                s_game.progress_dirty = false;
+                s_game.best_dirty = false;
+                const uint32_t best = s_game.best > s_rec.best ? s_game.best : s_rec.best;
+                const uint8_t level = s_game.level > s_rec.level ? s_game.level : s_rec.level;
+                if (best != s_rec.best || level != s_rec.level) {
+                    s_rec.best = best;
+                    s_rec.level = level;
+                    rec_best = best;
+                    rec_level = level;
+                    need_record = true;
+                }
             }
             data_unlock();
         }
-        // Flash 写不进 LVGL 任务,也不在按键回调里:一局最多走这一次。
-        if (need_save && zombie_store_save_best(save_best)) {
-            // 纪录已经落盘,下一局的"破纪录"高亮要跟新纪录比,否则一直显示 NEW HI。
-            s_best_at_boot = save_best;
-        } else if (need_save) {
+        // Flash 写不进 LVGL 任务,也不在按键回调里:一局最多"每跨过一个新关卡一次 + 结束一次"。
+        if (need_record && !zombie_store_save_record(rec_best, rec_level)) {
             s_nvs_ok = false;
         }
         vTaskDelay(pdMS_TO_TICKS(UI_TICK_MS));
@@ -1037,13 +1028,14 @@ esp_err_t app_zombie_start(void)
 {
     if (s_scr) return ESP_ERR_INVALID_STATE;
 
-    uint32_t best = 0;
-    s_nvs_ok = zombie_store_init(&best);
-    s_best_at_boot = best;
+    zombie_save_t save;
+    s_nvs_ok = zombie_store_init(&save);
+    s_rec = save;
+    s_best_at_boot = save.best;
     // 种子用启动时刻:每次开机都刷出不同的一局,host 侧的可复现性由
     // zombie_game 的种子参数保证(测试里传固定种子)。
-    zg_init(&s_game, (uint32_t)now_us(), best);
-    s_win_logged = false;
+    // 读回来的是纪录不是断点:关卡永远从第一关起,纪录只参与 HI 显示与底部那一行。
+    zg_init(&s_game, (uint32_t)now_us(), save.best);
 
     s_keys = xQueueCreate(ZG_KEY_QUEUE_LEN, sizeof(key_msg_t));
     s_data_lock = xSemaphoreCreateMutex();
@@ -1067,10 +1059,12 @@ esp_err_t app_zombie_start(void)
         s_task = NULL;
         goto fail_page;
     }
-    ESP_LOGI(TAG, "游戏就绪:UP=左 DOWN=右(按住 0.5 秒翻倍),OK 长按暂停,每 %ld 分换关共 %d 关,%ld 分通关,历史最高分 %lu",
-             (long)ZG_LEVEL_SCORE_STEP, ZG_LEVEL_MAX, (long)ZG_WIN_SCORE,
-             (unsigned long)best);
-    ESP_LOGI(TAG, "克隆卡片:接住种下 %d 株克隆豌豆,僵尸 %d 秒后学会复制再持续 %d 秒",
+    ESP_LOGI(TAG, "游戏就绪:UP=左 DOWN=右(按住 0.5 秒翻倍),OK 长按暂停,每 %ld 分换一关;"
+                  "无尽没有通关线(每 %d 关一个阶梯 x1/x2/x4/x6,第 %d 关起停在 x6),"
+                  "开机固定从第一关开始;纪录 %lu 分 / 最远第 %u 关",
+             (long)ZG_LEVEL_SCORE_STEP, ZG_TIER_LEVELS, ZG_LEVEL_MAX - ZG_TIER_LEVELS + 1,
+             (unsigned long)save.best, (unsigned)save.level);
+    ESP_LOGI(TAG, "克隆卡片:接住种下 %d 株克隆豌豆,僵尸 %d 秒后学会复制再持续 %d 秒;掉下来的卡片僵尸有概率抢吃",
              ZG_POOL_CLONES, ZG_ZOMBIE_LEARN_MS / 1000, ZG_ZOMBIE_CLONE_MS / 1000);
     return ESP_OK;
 

@@ -22,10 +22,12 @@
 #define FX_TTL_CLONE   1400   // 卡片生效的横幅:要多给一点时间,这行字解释的是新玩法
 #define FX_TTL_ZCLONE   900   // 一只分身落地的那圈
 #define FX_TTL_ZLEARN  1500   // "僵尸学会了"这条警告要比好消息更显眼
+#define FX_TTL_ZEAT    1500   // 卡片被僵尸抢吃:和"学会了"同级,都是坏消息
 
-// 档位跟着关卡走:第 1/3/5/7/9 关各换一档,所以"换关"一定同时看得见怪变多、
-// 枪变强,不会只有一行字。发数最多 4(和道具加成共用 ZG_MAX_SHOTS 这个顶):
-// 三个维度一起往前推——弹速 220→440、间隔 900→300、伤害 1→4。
+// 档位跟着关卡走:第 1/3/5/7/9 关各换一档,进难度阶梯的三关(11/21/31)再各换一档,
+// 所以"换关"一定同时看得见怪变多、枪变强,不会只有一行字。
+// 发数最多 4(和道具加成共用 ZG_MAX_SHOTS 这个顶),所以阶梯上再加的三档涨的是伤害与
+// 穿透:僵尸血按 2/4/6 倍涨,枪不跟着涨就只剩"打不动"。
 // 开局那颗豌豆就是要"慢慢吐、打两下才死",难的地方留给走位。
 static const zg_weapon_info_t WPN[ZG_WPN_COUNT] = {
     //  名称       间隔  发数 扇距 伤害 穿透 弹速  起用关卡
@@ -34,7 +36,23 @@ static const zg_weapon_info_t WPN[ZG_WPN_COUNT] = {
     { "THREE",    520,   3,  12,  2,  0,  320,    5 },
     { "RAPID",    300,   3,  10,  2,  0,  380,    7 },
     { "RAILGUN",  420,   4,  12,  4,  2,  440,    9 },
+    { "PLASMA",   380,   4,  14,  8,  3,  480,   11 },
+    { "NOVA",     320,   4,  14, 16,  5,  520,   21 },
+    { "PULSAR",   260,   4,  16, 32,  7,  560,   31 },
 };
+
+// ---- 难度阶梯 ----
+// 一个阶梯 ZG_TIER_LEVELS 关,前三个阶梯正好排到 ZG_LEVEL_MAX 关;第四个阶梯没有尽头,
+// 第 31 关往上一路都是 ×6。倍数按百分数存,乘完再除,引擎里不出现浮点。
+// 血量/刷怪密度/抢卡概率用 1/2/4/6:这是"能力变强"的主轴,乘得狠也读得出来。
+// 速度单独用 1/1.5/2/2.5:同样乘 6 的话,第 31 关的小僵尸 0.7 秒就冲到底边,
+// 玩家连抬手跟枪的速度都跟不上,那不叫难叫看不见。所以速度这一列单独收一档,
+// 每跳一级仍然明显更快,但顶到 ZG_ZOMBIE_VY_MAX 之前一直在能反应的区间里。
+// 无尽段(41 关起)倍数不再涨,难度靠"每 5 关 +1 血"继续往上推,推到一枪打不死为止,
+// 那一关就是这一局的终点——没有通关线,输赢只看还剩几条命。
+static const int32_t TIER_HP_MUL[ZG_TIER_COUNT] = { 100, 200, 400, 600 };
+static const int32_t TIER_VY_MUL[ZG_TIER_COUNT] = { 100, 150, 200, 250 };
+static const uint8_t TIER_EAT_PCT[ZG_TIER_COUNT] = { 20, 30, 50, 60 };
 
 // 血量与速度都从"第 1 关几乎没威胁"起步:小僵尸 2 血、16 px/s,从屏幕上方走完
 // 250px 要十几秒,足够先看清局面再抬手。
@@ -130,32 +148,82 @@ const zg_item_info_t *zg_item_info(zg_item_kind_t kind)
 
 uint8_t zg_level_of_score(uint32_t score)
 {
+    // 无尽:关卡跟着分数一路往上走,只在 uint8_t 的顶上收住,免得绕回第 1 关。
     const uint32_t level = score / ZG_LEVEL_SCORE_STEP + 1u;
-    return (uint8_t)(level > ZG_LEVEL_MAX ? ZG_LEVEL_MAX : level);
+    return (uint8_t)(level > ZG_LEVEL_CEIL ? ZG_LEVEL_CEIL : level);
 }
 
-// 难度公式一律先把级别夹到 1..ZG_LEVEL_MAX:外面传进来越界也不会把数值放飞。
+// 难度公式一律先把级别夹到 1..ZG_LEVEL_CEIL:越界入参不会把数值放飞,
+// 无尽段的高关卡则照常参与涨血——天花板只防溢出,不当难度上限。
 static int32_t level_cap(uint8_t level)
 {
-    return clamp32(level, 1, ZG_LEVEL_MAX);
+    return clamp32(level, 1, ZG_LEVEL_CEIL);
+}
+
+uint8_t zg_tier_of(uint8_t level)
+{
+    const int32_t tier = (level_cap(level) - 1) / ZG_TIER_LEVELS;
+    return (uint8_t)(tier > ZG_TIER_COUNT - 1 ? ZG_TIER_COUNT - 1 : tier);
+}
+
+int32_t zg_tier_hp_mul(uint8_t level)
+{
+    return TIER_HP_MUL[zg_tier_of(level)];
+}
+
+int32_t zg_tier_vy_mul(uint8_t level)
+{
+    return TIER_VY_MUL[zg_tier_of(level)];
+}
+
+uint8_t zg_tier_mul(uint8_t level)
+{
+    // UI 直接打印这个数(×1/×2/×4/×6),所以它必须正好是百分数那一列的整数倍。
+    return (uint8_t)(zg_tier_hp_mul(level) / 100);
+}
+
+bool zg_tier_is_head(uint8_t level)
+{
+    const int32_t lv = level_cap(level);
+    return lv > 1 && (lv - 1) % ZG_TIER_LEVELS == 0;
+}
+
+uint8_t zg_zombie_eat_chance_pct(uint8_t level)
+{
+    return TIER_EAT_PCT[zg_tier_of(level)];
 }
 
 int32_t zg_zombie_hp(zg_zombie_type_t type, uint8_t level)
 {
-    // 每 4 关才加 1 点血:第 10 关小僵尸 4 血,而那时手里最少是三伤的枪,一发多就倒。
-    return zg_zombie_info(type)->base_hp + (level_cap(level) - 1) / 4;
+    // 第一阶梯内每 5 关才加 1 点血:第 10 关小僵尸 3 血,而那时手里最少是三伤的枪,
+    // 一发多就倒。进阶梯再把整块血乘上去:第 11 关 8 血,第 40 关 54 血,配 PULSAR 的
+    // 32 伤仍然只是"两三下",不是"打不完"——这个"最贵的一关也要在预算发数内倒下"
+    // 是手感测试钉着的硬约束,所以血涨得比枪慢。
+    // 无尽段(41 关起)倍数停在 ×6,但每 5 关 +1 血还在走:血越来越厚直到一枪清不干净,
+    // 这就是无尽局的终点。血存进 uint8_t 字段,所以最终再夹一次,免得截断成看得见的低值。
+    const int32_t base = zg_zombie_info(type)->base_hp + (level_cap(level) - 1) / 5;
+    const int32_t hp = (base * zg_tier_hp_mul(level)) / 100;
+    return hp > 255 ? 255 : hp;
 }
 
 int32_t zg_zombie_vy(zg_zombie_type_t type, uint8_t level)
 {
-    return zg_zombie_info(type)->base_vy + (level_cap(level) - 1);   // 第 10 关只比第 1 关快 9 px/s
+    // 第一阶梯内每关 +1 px/s(第 10 关只比第 1 关快 9 px/s,这条被手感测试钉着),
+    // 往后再乘阶梯速度表并夹在硬顶之下。
+    const int32_t base = zg_zombie_info(type)->base_vy + (level_cap(level) - 1);
+    const int32_t vy = (base * zg_tier_vy_mul(level)) / 100;
+    return vy > ZG_ZOMBIE_VY_MAX ? ZG_ZOMBIE_VY_MAX : vy;
 }
 
 uint16_t zg_spawn_interval_ms(uint8_t level)
 {
-    // 第 1 关 3.4 秒一只,逐级降到第 10 关 1.24 秒:"后面慢慢变多"首先就是这里变快。
-    const int32_t interval = 3400 - (level_cap(level) - 1) * 240;
-    return (uint16_t)(interval < 1200 ? 1200 : interval);
+    // 第 1 关 3.4 秒一只,第一阶梯走完降到 1.24 秒:"后面慢慢变多"首先就是这里变快。
+    // 进阶梯后按同一个倍数再压一刀:第 11 关起 0.6 秒一只,到 ZG_SPAWN_MIN_MS 收住,
+    // 之后的压迫感来自血更厚和同屏更满,而不是一屏塞满读不出人。
+    int32_t interval = 3400 - (level_cap(level) - 1) * 240;
+    if (interval < 1200) interval = 1200;
+    interval = (interval * 100) / zg_tier_hp_mul(level);
+    return (uint16_t)(interval < ZG_SPAWN_MIN_MS ? ZG_SPAWN_MIN_MS : interval);
 }
 
 uint8_t zg_max_alive(uint8_t level)
@@ -185,9 +253,10 @@ const zg_zombie_info_t *zg_unlock_at(uint8_t level)
 
 uint8_t zg_lawn_group(uint8_t level)
 {
-    // 1~3 / 4~6 / 7~9 / 10:四档色阶,换档正好落在新僵尸登场的那几关上。
-    const int32_t group = (level_cap(level) - 1) / 3;
-    return (uint8_t)(group > ZG_LAWN_GROUPS - 1 ? ZG_LAWN_GROUPS - 1 : group);
+    // 色阶边界和难度阶梯用同一条线(1/11/21/31 关):换草皮就等于"进了下一个阶梯",
+    // 玩家不读横幅也看得见局面变了。原来那套 1/4/7/10 的分法在 40 关里只会走完一次,
+    // 后面 30 关草坪不再变化,换关就只剩一行字。
+    return zg_tier_of(level);
 }
 
 zg_weapon_t zg_weapon_for_level(uint8_t level)
@@ -214,23 +283,12 @@ uint16_t zg_fire_interval_ms(const zg_game_t *game)
     return (game->rapid_ms > 0) ? (uint16_t)(base / ZG_RAPID_DIV) : base;
 }
 
-zg_medal_t zg_medal_of(uint8_t lives)
+uint8_t zg_clone_damage(uint8_t level)
 {
-    // 命数是唯一标准:通关时手里还有 3 条命就是全程没丢过命。
-    if (lives >= 3) return ZG_MEDAL_GOLD;
-    if (lives == 2) return ZG_MEDAL_SILVER;
-    return ZG_MEDAL_BRONZE;
-}
-
-const char *zg_medal_name(zg_medal_t medal)
-{
-    switch (medal) {
-    case ZG_MEDAL_GOLD:   return "GOLD";
-    case ZG_MEDAL_SILVER: return "SILVER";
-    case ZG_MEDAL_BRONZE: return "BRONZE";
-    case ZG_MEDAL_NONE:
-    default:              return "NONE";
-    }
+    // 克隆射手是卡片白送的三株枪,不该在后期变成三株摆设:伤害跟着血量倍数一起涨,
+    // 但仍比同阶梯的本体低好几档——升枪的收益还是归本体。
+    const int32_t dmg = (ZG_CLONE_DAMAGE * zg_tier_hp_mul(level)) / 100;
+    return (uint8_t)(dmg < 1 ? 1 : dmg);
 }
 
 // ---- 对象池 ----
@@ -339,10 +397,17 @@ static void clear_field(zg_game_t *g)
     clear_card(g);
 }
 
+static void track_best(zg_game_t *g)
+{
+    // 破纪录先记在 RAM:HUD 上的 HI 要立刻跟着涨。写盘的时机不在这儿——每打死一只都
+    // 标记一次等于每十几秒一次 Flash 写,无尽局会一直写个没完。
+    if (g->score > g->best) g->best = g->score;
+}
+
 static void commit_best(zg_game_t *g)
 {
-    if (g->score <= g->best) return;
-    g->best = g->score;
+    // 只在"这一局有了结论"时调用:换关由 progress_dirty 触发落盘,打死由这里触发。
+    track_best(g);
     g->best_dirty = true;   // 落盘交给应用层:引擎不碰 NVS
 }
 
@@ -612,7 +677,7 @@ static void shoot_zombies(zg_game_t *g)
             const int32_t gain = (int32_t)zg_zombie_info(z->type)->score;
             g->score += (uint32_t)(z->is_clone ? gain / ZG_ZCLONE_SCORE_DIV : gain);
             fx_add(g, ZG_FX_DEATH, zcx(z), zcy(z), FX_TTL_DEATH);
-            if (g->score > g->best) commit_best(g);   // 破纪录随时标记,结束时要落盘
+            track_best(g);   // 只把 HI 抬上屏幕,写盘等换关或结束
             // 穿甲弹打死一只不算打完:剩下的穿透次数继续往下攒,才能一排扫掉。
             if (b->pierce_left > 0) { b->pierce_left--; continue; }
             b->alive = false;
@@ -686,7 +751,7 @@ static void step_clones(zg_game_t *g, uint16_t dt)
             .y = ZG_PX_TO_POS(zg_clone_y() - 2),
             .vx = 0,
             .vy = -ZG_CLONE_SPEED,
-            .damage = ZG_CLONE_DAMAGE,
+            .damage = zg_clone_damage(g->level),
             .pierce_left = 0,
             .alive = true,
         };
@@ -695,21 +760,11 @@ static void step_clones(zg_game_t *g, uint16_t dt)
 
 // 僵尸的复制:母体分裂出一只血更少的分身,横向错开一个身位,免得和母体叠成同一只。
 // 每只母体一辈子只生一次,分身自己也不再往下生——否则 20 秒窗口就是指数增长。
-static void spawn_zombie_clone(zg_game_t *g)
+static void split_clone(zg_game_t *g, zg_zombie_t *src)
 {
-    if (zg_alive_count(g) >= ZG_POOL_ZOMBIES) return;   // 反噬只吃池子余量,不挤掉正常刷怪
+    if (zg_alive_count(g) >= ZG_POOL_ZOMBIES) return;   // 分身只吃池子余量,不挤掉正常刷怪
 
-    int pick = -1;
-    for (unsigned i = 0; i < ZG_POOL_ZOMBIES; i++) {
-        const zg_zombie_t *z = &g->zombies[i];
-        if (!z->alive || z->is_clone || z->cloned) continue;
-        if (z->telegraph_ms > 0) continue;   // 突袭僵尸还在预警,不算落地成型
-        pick = (int)i;
-        break;
-    }
-    if (pick < 0) return;
-
-    zg_zombie_t *src = &g->zombies[pick];
+    // 池子已满时这次机会照样用掉:不然每帧换一只母体来试,窗口一开就永远在排队。
     src->cloned = true;
 
     zg_zombie_t *slot = NULL;
@@ -740,8 +795,44 @@ static void spawn_zombie_clone(zg_game_t *g)
     fx_add(g, ZG_FX_ZCLONE, zcx(slot), zcy(slot), FX_TTL_ZCLONE);
 }
 
-// 卡片反噬的两段计时:先 10 秒空窗(把克隆的收益先给完),再 20 秒复制窗口。
-// 窗口走完就把 clone_active 收掉:反噬是有期限的,不是永久的。己方克隆留到丢命为止。
+// 复制窗口里挑一只还没当过母体的僵尸来分裂:分身不当母体(否则窗口就是指数增长),
+// 还在预警的突袭僵尸也还不算落地成型。
+static void spawn_zombie_clone(zg_game_t *g)
+{
+    for (unsigned i = 0; i < ZG_POOL_ZOMBIES; i++) {
+        const zg_zombie_t *z = &g->zombies[i];
+        if (!z->alive || z->is_clone || z->cloned) continue;
+        if (z->telegraph_ms > 0) continue;
+        split_clone(g, &g->zombies[i]);
+        return;
+    }
+}
+
+// 打开僵尸的复制窗口。玩家卡片的反噬和僵尸自己抢到卡片共用这一个窗口,只是时长不同,
+// 所以"场上开始出分身"这件事只有一条路径。窗口已经开着就只往长了续,不把它剪短。
+static void open_zclone_window(zg_game_t *g, uint16_t ms)
+{
+    // 新开的那一刻就把步长清零,第一只分身当场出现,不多等一个 3 秒。
+    if (g->zclone_ms == 0) g->zclone_step_ms = 0;
+    if (g->zclone_ms < ms) g->zclone_ms = ms;
+}
+
+// 窗口自己的计时:每隔 ZG_ZOMBIE_CLONE_STEP_MS 放出一只分身。换关横幅期间不登场,
+// 和正常刷怪同一条规矩——那 1.8 秒是留给玩家读字的,横幅一落倒计时已经归零。
+static void step_zclone(zg_game_t *g, uint16_t dt)
+{
+    if (g->zclone_ms == 0) return;
+    g->zclone_ms = tick_down(g->zclone_ms, dt);
+    g->zclone_step_ms = tick_down(g->zclone_step_ms, dt);
+    if (g->zclone_step_ms == 0 && g->levelup_ms == 0) {
+        spawn_zombie_clone(g);
+        g->zclone_step_ms = ZG_ZOMBIE_CLONE_STEP_MS;
+    }
+}
+
+// 玩家那张卡片的两段计时:先 10 秒空窗(把克隆的收益先给完),空窗走完打开 20 秒窗口,
+// 窗口走完就把 clone_active 收掉。放分身这件事在 step_zclone 里,因为僵尸自己抢到卡片
+// 时也开同一个窗口,那条路不该要求玩家手上有一张卡片。己方克隆留到丢命为止。
 static void step_card(zg_game_t *g, uint16_t dt)
 {
     if (!g->clone_active) return;
@@ -749,27 +840,47 @@ static void step_card(zg_game_t *g, uint16_t dt)
     if (g->learn_ms > 0) {
         g->learn_ms = tick_down(g->learn_ms, dt);
         if (g->learn_ms > 0) return;
-        g->zclone_ms = ZG_ZOMBIE_CLONE_MS;
-        g->zclone_step_ms = 0;   // 学会的那一刻就放出第一只,别让人多等 3 秒
+        open_zclone_window(g, ZG_ZOMBIE_CLONE_MS);
         fx_add(g, ZG_FX_ZLEARN, ZG_FIELD_W / 2, ZG_FIELD_H / 3, FX_TTL_ZLEARN);
         return;
     }
 
-    if (g->zclone_ms == 0) {
-        g->clone_active = false;   // 这一张卡片的账结清了
+    if (g->zclone_ms == 0) g->clone_active = false;   // 这一张卡片的账结清了
+}
+
+// 僵尸抢卡片:一只正在下落的克隆卡片撞上落地僵尸时判一次概率。抢到手就当场分裂一只
+// 分身,并把场上其他僵尸的复制窗口一起打开——所以后期"卡片落下来了"不再等于白拿。
+// 只对克隆卡片生效:另外两件是玩家自己的枪的强化,僵尸吃了说不清是什么表现。
+// 判定只摇一次(把卡片标成 dodged):不然它穿过卡片那几十帧每帧重摇,标称 20% 会变成
+// 几乎必抢。抢不到的那张继续往下飘,玩家仍然接得到。
+static void try_eat_card(zg_game_t *g, zg_item_t *it)
+{
+    if (it->kind != ZG_ITEM_CLONE || it->dodged) return;
+
+    for (unsigned i = 0; i < ZG_POOL_ZOMBIES; i++) {
+        zg_zombie_t *z = &g->zombies[i];
+        // 分身不抢:它能抢就能再生,复制窗口就从现在的"每只母体一次"变成滚雪球。
+        if (!z->alive || z->is_clone || z->telegraph_ms > 0) continue;
+        if (!overlap(z->x, ZG_PX_TO_POS(z->w), z->y, ZG_PX_TO_POS(z->h),
+                     it->x, ZG_PX_TO_POS(ZG_ITEM_SIZE), it->y,
+                     ZG_PX_TO_POS(ZG_ITEM_SIZE))) {
+            continue;
+        }
+        it->dodged = true;
+        if (rnd_below(&g->rng, 100) >= zg_zombie_eat_chance_pct(g->level)) return;
+
+        z->carded = true;
+        it->alive = false;
+        fx_add(g, ZG_FX_ZEAT, (int16_t)(ZG_POS_TO_PX(it->x) + ZG_ITEM_SIZE / 2),
+               (int16_t)(ZG_POS_TO_PX(it->y) + ZG_ITEM_SIZE / 2), FX_TTL_ZEAT);
+        split_clone(g, z);                        // 抢到手的那只当场多出一只分身
+        open_zclone_window(g, ZG_ZEAT_CLONE_MS);  // 其他母体跟着复制一阵
         return;
-    }
-    g->zclone_ms = tick_down(g->zclone_ms, dt);
-    g->zclone_step_ms = tick_down(g->zclone_step_ms, dt);
-    // 换关横幅期间不登场,和正常刷怪同一条规矩:那 1.8 秒是留给玩家读字的,
-    // 横幅一落,倒计时已经归零,分身当场出现。
-    if (g->zclone_step_ms == 0 && g->levelup_ms == 0) {
-        spawn_zombie_clone(g);
-        g->zclone_step_ms = ZG_ZOMBIE_CLONE_STEP_MS;
     }
 }
 
 // 接到道具:改状态、亮特效;漏过底边只是消失,不扣分——道具是奖励,不该变成负担。
+// 唯一的风险是克隆卡片可能被僵尸抢走(见 try_eat_card),所以走位接卡在高阶梯有代价。
 static void step_items(zg_game_t *g, uint16_t dt)
 {
     for (unsigned i = 0; i < ZG_POOL_ITEMS; i++) {
@@ -790,6 +901,7 @@ static void step_items(zg_game_t *g, uint16_t dt)
             it->alive = false;
             continue;
         }
+        try_eat_card(g, it);   // 玩家没接到:落到哪一段都可能被僵尸顺手抢走
         if (it->y >= ZG_PX_TO_POS(ZG_FIELD_H)) it->alive = false;
     }
 }
@@ -837,13 +949,17 @@ void zg_init(zg_game_t *game, uint32_t seed, uint32_t best)
 
 bool zg_restart(zg_game_t *game)
 {
-    // GAME OVER 和通关都算"这一局结束了",左右键才是重开;进行中按左右只是走位。
-    if (game->phase != ZG_PHASE_OVER && game->phase != ZG_PHASE_WIN) return false;
+    // GAME OVER 才算"这一局结束了",左右键才是重开;进行中按左右只是走位。
+    if (game->phase != ZG_PHASE_OVER) return false;
     const uint32_t best = game->best;
     const uint32_t rng = game->rng;
     const bool dirty = game->best_dirty;
+    const bool progressed = game->progress_dirty;
     zg_init(game, rng, best);
-    game->best_dirty = dirty;   // 还没落盘的纪录不能因为重开而丢掉
+    // 还没落盘的纪录和换关标记不能因为重开而丢掉:重开是把上一局的结论清零,
+    // 不是把上一局该写盘的账抹掉。
+    game->best_dirty = dirty;
+    game->progress_dirty = progressed;
     return true;
 }
 
@@ -860,9 +976,8 @@ void zg_set_keys(zg_game_t *game, bool left, bool right)
 
 void zg_set_paused(zg_game_t *game, bool paused)
 {
-    // 结束和通关都已经不算"正在一局",那里不需要暂停,重开会自然清掉。
-    game->paused = paused && (game->phase != ZG_PHASE_OVER) &&
-                   (game->phase != ZG_PHASE_WIN);
+    // 结束已经不算"正在一局",那里不需要暂停,重开会自然清掉。
+    game->paused = paused && (game->phase != ZG_PHASE_OVER);
 }
 
 void zg_step(zg_game_t *game, uint16_t dt_ms)
@@ -891,20 +1006,15 @@ void zg_step(zg_game_t *game, uint16_t dt_ms)
         step_bullets(game, dt);
         step_zombies(game, dt);
         shoot_zombies(game);   // 移动之后再判定,一帧内不会出现"穿过又打中"
-        // 分数在这一帧可能刚好跨过一档,所以通关和换关都在判定之后算:
-        // 先判通关,不然可能"踏过终点又挨一下"。
-        if (game->score >= ZG_WIN_SCORE) {
-            game->phase = ZG_PHASE_WIN;
-            game->level = ZG_LEVEL_MAX;
-            game->levelup_ms = 0;
-            clear_field(game);
-            commit_best(game);
-            return;
-        }
+        // 分数在这一帧可能刚好跨过一档,所以换关判定排在命中判定之后:
+        // 无尽模式没有终点线,跨过一档就只是换关、亮横幅,局照样往下走。
         if (zg_level_of_score(game->score) != game->level) {
             // 换关:横幅亮起来,刷怪和掉道具在那几帧按住;枪跟着关卡一起升档。
             game->level = zg_level_of_score(game->score);
             game->levelup_ms = ZG_LEVELUP_MS;
+            // 每跨过一关就标一次待存档:引擎不碰 NVS,由应用层比对"最远关卡"再决定写不写。
+            // 一局打到底也就几十次,摊在每 1000 分一次的水平上不用担心磨损。
+            game->progress_dirty = true;
             const zg_weapon_t next = zg_weapon_for_level(game->level);
             if (next != game->weapon) {
                 game->weapon = next;
@@ -912,11 +1022,11 @@ void zg_step(zg_game_t *game, uint16_t dt_ms)
             }
         }
         step_spawn(game, dt);
-        step_items(game, dt);
+        step_items(game, dt);   // 这里可能判定"僵尸抢卡片",所以窗口计时排在它后面
+        step_zclone(game, dt);
         step_card(game, dt);   // 反噬放在判定之后:新分身这一帧不该立刻挨子弹
         return;
     case ZG_PHASE_OVER:
-    case ZG_PHASE_WIN:
     default:
         return;
     }

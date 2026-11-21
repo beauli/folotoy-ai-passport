@@ -2,7 +2,9 @@
 // 豌豆射手守草坪引擎的 host 测试:纯逻辑,不依赖 ESP-IDF/LVGL。
 // 这里钉的是"手感数值 + 判定规则":几发打死一只、什么时候自动换枪、
 // 漏怪和撞人各扣多少血、10 血 3 命怎么结账、跳跃/突袭僵尸的特权什么时候生效,
-// 以及 10 个级别的难度曲线——开局必须弱,后面逐级变强,枪要跟着一起变强。
+// 以及 40 关四个难度阶梯的难度曲线——开局必须弱,后面逐级变强、枪跟着一起变强,
+// 阶梯起点血量/刷怪/抢卡概率一起跳档。另外钉住两件事:僵尸有概率抢吃掉下来的克隆
+// 卡片,以及每跨过一关都要留下一份可落盘的进度(存档本身归应用层)。
 // 这些一旦改错,设备上看起来只是"变难了一点",很难靠肉眼发现。
 #include <assert.h>
 #include <stdio.h>
@@ -113,7 +115,7 @@ static void test_tables_are_consistent(void)
         // 多发必须是扇形,否则几颗豌豆全叠在同一条线上,算不上"多个方向"。
         if (w->shots > 1) assert(w->spread_px >= 4);
     }
-    // 枪跟着关卡走:第 1/3/5/7/9 关各换一档,换关一定能感到枪也变了。
+    // 枪跟着关卡走:第一个阶梯 1/3/5/7/9 关各换一档,往后每个阶梯的起点再换一档。
     assert(zg_weapon_info(ZG_WPN_PEA)->first_level == 1);
     assert(zg_weapon_for_level(1) == ZG_WPN_PEA);
     assert(zg_weapon_for_level(2) == ZG_WPN_PEA);
@@ -124,10 +126,25 @@ static void test_tables_are_consistent(void)
     assert(zg_weapon_for_level(7) == ZG_WPN_RAPID);
     assert(zg_weapon_for_level(8) == ZG_WPN_RAPID);
     assert(zg_weapon_for_level(9) == ZG_WPN_RAILGUN);
-    assert(zg_weapon_for_level(ZG_LEVEL_MAX) == ZG_WPN_RAILGUN);
+    assert(zg_weapon_for_level(10) == ZG_WPN_RAILGUN);
+    // 阶梯起点(11/21/31 关)各换一档:僵尸血量按 2/4/6 倍涨,枪不跟上就是打不动。
+    assert(zg_weapon_for_level(11) == ZG_WPN_PLASMA);
+    assert(zg_weapon_for_level(20) == ZG_WPN_PLASMA);
+    assert(zg_weapon_for_level(21) == ZG_WPN_NOVA);
+    assert(zg_weapon_for_level(30) == ZG_WPN_NOVA);
+    assert(zg_weapon_for_level(31) == ZG_WPN_PULSAR);
+    assert(zg_weapon_for_level(ZG_LEVEL_MAX) == ZG_WPN_PULSAR);
     // 越界传进来也不能放飞:第 0 关和第 99 关都得夹回首尾两档。
     assert(zg_weapon_for_level(0) == ZG_WPN_PEA);
-    assert(zg_weapon_for_level(99) == ZG_WPN_RAILGUN);
+    assert(zg_weapon_for_level(99) == ZG_WPN_PULSAR);
+    // 往后的档位涨的是伤害与穿透,不是发数:4 发已经是弹池和读屏的顶。
+    for (unsigned i = ZG_WPN_RAILGUN; i < ZG_WPN_COUNT; i++) {
+        assert(zg_weapon_info((zg_weapon_t)i)->shots == ZG_MAX_SHOTS);
+        assert(zg_weapon_info((zg_weapon_t)i)->damage >
+               zg_weapon_info((zg_weapon_t)(i - 1))->damage);
+        assert(zg_weapon_info((zg_weapon_t)i)->pierce >
+               zg_weapon_info((zg_weapon_t)(i - 1))->pierce);
+    }
 
     for (unsigned t = 0; t < ZG_Z_TYPE_COUNT; t++) {
         const zg_zombie_info_t *z = zg_zombie_info((zg_zombie_type_t)t);
@@ -146,8 +163,13 @@ static void test_tables_are_consistent(void)
         assert(zg_zombie_info((zg_zombie_type_t)t)->score <= ZG_LEVEL_SCORE_STEP / 2);
     }
     // 四种僵尸得按关卡逐个解锁,而且先是"大而慢"的,再是"快"的。
-    assert(ZG_LEVEL_MAX == 10);
-    assert(ZG_WIN_SCORE == (uint32_t)ZG_LEVEL_SCORE_STEP * ZG_LEVEL_MAX);
+    // 阶梯:每 10 关一个倍数档,四个阶梯把 1/2/4/6 排满到第 40 关。
+    assert(ZG_TIER_LEVELS == 10);
+    assert(ZG_TIER_COUNT == 4);
+    assert(ZG_LEVEL_MAX == ZG_TIER_LEVELS * ZG_TIER_COUNT);
+    // 第 40 关不是终点:无尽模式没有通关线,关卡唯一的上限是防 uint8_t 回绕的那个数。
+    assert(ZG_LEVEL_CEIL == 255);
+    assert(ZG_LEVEL_CEIL > ZG_LEVEL_MAX);
     assert(zg_zombie_info(ZG_Z_SMALL)->unlock_level == 1);
     assert(zg_zombie_info(ZG_Z_BIG)->unlock_level == 3);
     assert(zg_zombie_info(ZG_Z_JUMPER)->unlock_level == 5);
@@ -460,7 +482,8 @@ static void test_small_zombie_dies_in_two_rifle_shots(void)
     assert(g.kills == 1);
     assert(g.score == zg_zombie_info(ZG_Z_SMALL)->score);
     assert(g.weapon == ZG_WPN_PEA);         // 10 分还不到换枪门槛
-    assert(g.best == g.score && g.best_dirty);   // 破了 0 分纪录,标记待落盘
+    assert(g.best == g.score);                    // HI 立刻跟着涨,屏幕上要看得见
+    assert(!g.best_dirty);                        // 但不写盘:无尽局每十几秒就破一次纪录
     // 打死要有死亡特效,不然玩家不知道掉的是什么。
     bool death_fx = false;
     for (unsigned i = 0; i < ZG_POOL_FX; i++) {
@@ -717,17 +740,34 @@ static void test_difficulty_ramps_and_caps(void)
     assert(zg_level_of_score(0) == 1);
     assert(zg_level_of_score(ZG_LEVEL_SCORE_STEP - 1) == 1);
     assert(zg_level_of_score(ZG_LEVEL_SCORE_STEP) == 2);
-    assert(zg_level_of_score(ZG_WIN_SCORE - 1) == ZG_LEVEL_MAX);
-    assert(zg_level_of_score(1000000u) == ZG_LEVEL_MAX);
+    assert(zg_level_of_score((uint32_t)ZG_LEVEL_SCORE_STEP * ZG_LEVEL_MAX - 1u) == ZG_LEVEL_MAX);
+    // 无尽段:40000 分是第 41 关的起点,不是终点线。
+    assert(zg_level_of_score((uint32_t)ZG_LEVEL_SCORE_STEP * ZG_LEVEL_MAX) == ZG_LEVEL_MAX + 1);
+    // 分数再高也只是关卡号,夹在 uint8_t 顶上是防它回绕成"第 1 关"。
+    assert(zg_level_of_score(1000000u) == ZG_LEVEL_CEIL);
     for (uint8_t lv = 1; lv < ZG_LEVEL_MAX; lv++) {
         assert(zg_zombie_hp(ZG_Z_SMALL, (uint8_t)(lv + 1)) >= zg_zombie_hp(ZG_Z_SMALL, lv));
         assert(zg_zombie_vy(ZG_Z_SMALL, (uint8_t)(lv + 1)) > zg_zombie_vy(ZG_Z_SMALL, lv));
         assert(zg_zombie_vy(ZG_Z_BIG, (uint8_t)(lv + 1)) > zg_zombie_vy(ZG_Z_BIG, lv));
         assert(zg_spawn_interval_ms((uint8_t)(lv + 1)) <= zg_spawn_interval_ms(lv));
     }
-    // 封顶:第 10 关以后不再无限涨,否则后期数值会失控。
+    // 无尽段(第 41 关往上)还得继续变难,但只有血继续涨:速度早就顶在硬顶上,
+    // 刷怪间隔也 floor 在 0.5 秒,不然"无尽"会退化成"一屏看不清"。
+    for (uint8_t lv = ZG_LEVEL_MAX; lv < ZG_LEVEL_CEIL; lv++) {
+        assert(zg_tier_of(lv) == ZG_TIER_COUNT - 1);       // 倍数停在最后一档
+        assert(zg_zombie_hp(ZG_Z_SMALL, (uint8_t)(lv + 1)) >= zg_zombie_hp(ZG_Z_SMALL, lv));
+        assert(zg_zombie_vy(ZG_Z_SMALL, (uint8_t)(lv + 1)) >= zg_zombie_vy(ZG_Z_SMALL, lv));
+        assert(zg_zombie_vy(ZG_Z_SMALL, (uint8_t)(lv + 1)) <= ZG_ZOMBIE_VY_MAX);
+        assert(zg_spawn_interval_ms(lv) >= ZG_SPAWN_MIN_MS);
+    }
+    assert(zg_zombie_hp(ZG_Z_SMALL, 60) > zg_zombie_hp(ZG_Z_SMALL, ZG_LEVEL_MAX));
+    // 血最终夹在 uint8_t 之内:第 255 关小僵尸本来 312 血,不夹住会截成 56,
+    // 那就成了"越往后越好打",和无尽的意思正好相反。
+    assert(zg_zombie_hp(ZG_Z_SMALL, ZG_LEVEL_CEIL) == 255);
+    assert(zg_zombie_hp(ZG_Z_BIG, ZG_LEVEL_CEIL) == 255);
+    // 封顶:关卡越界也不涨,刷怪最密是硬底,再密就读不出人了。
     assert(zg_zombie_hp(ZG_Z_SMALL, ZG_LEVEL_MAX) > zg_zombie_hp(ZG_Z_SMALL, 1));
-    assert(zg_spawn_interval_ms(99) >= 1000);  // 最密也是一秒多一只,不会刷成一片
+    assert(zg_spawn_interval_ms(99) >= ZG_SPAWN_MIN_MS);  // 最密 0.5 秒一只
     assert(zg_spawn_interval_ms(99) <= zg_spawn_interval_ms(1));
     assert(zg_max_alive(99) == ZG_SPAWN_CAP);
     assert(zg_item_interval_ms(99) >= ZG_ITEM_MIN_MS);
@@ -788,6 +828,13 @@ static const zg_weapon_t GUN_BY_LEVEL[ZG_LEVEL_MAX + 1] = {
     ZG_WPN_PEA,                                                      // 占位,下标从 1 起
     ZG_WPN_PEA, ZG_WPN_PEA, ZG_WPN_SPLIT, ZG_WPN_SPLIT, ZG_WPN_THREE,
     ZG_WPN_THREE, ZG_WPN_RAPID, ZG_WPN_RAPID, ZG_WPN_RAILGUN, ZG_WPN_RAILGUN,
+    // 第二~第四阶梯:起点各换一档,后面九关沿用同一把。
+    ZG_WPN_PLASMA, ZG_WPN_PLASMA, ZG_WPN_PLASMA, ZG_WPN_PLASMA, ZG_WPN_PLASMA,
+    ZG_WPN_PLASMA, ZG_WPN_PLASMA, ZG_WPN_PLASMA, ZG_WPN_PLASMA, ZG_WPN_PLASMA,
+    ZG_WPN_NOVA, ZG_WPN_NOVA, ZG_WPN_NOVA, ZG_WPN_NOVA, ZG_WPN_NOVA,
+    ZG_WPN_NOVA, ZG_WPN_NOVA, ZG_WPN_NOVA, ZG_WPN_NOVA, ZG_WPN_NOVA,
+    ZG_WPN_PULSAR, ZG_WPN_PULSAR, ZG_WPN_PULSAR, ZG_WPN_PULSAR, ZG_WPN_PULSAR,
+    ZG_WPN_PULSAR, ZG_WPN_PULSAR, ZG_WPN_PULSAR, ZG_WPN_PULSAR, ZG_WPN_PULSAR,
 };
 
 // 每型僵尸允许的发数上限:小僵尸两发就倒,跳跃/突袭多给一发,大僵尸本来就是一堵墙。
@@ -801,10 +848,10 @@ static void test_gun_scales_with_level(void)
     level_pace(&pace_lo, &pace_hi, &kills);
     // 一关最多 10 只(第 1 关就是 10 只小僵尸),再多就是刷苦工而不是打法。
     assert(kills <= 10);
-    // 整局通关的合理区间:乐观两分多,悲观四分多。超出这个框,说明关卡分数或
-    // 刷怪节奏有一头飘了——上板时表现为"怎么都打不完"或"一会儿就通关"。
-    assert(pace_lo >= 90 && pace_lo <= 240);
-    assert(pace_hi >= pace_lo && pace_hi <= 300);
+    // 整局通关的合理区间:打得顺利三分钟,磨到底七八分钟。四个阶梯把上限抬到原来的
+    // 四倍多,正是"一会儿就结束"那条抱怨的回应;再往外就是关卡分数或刷怪节奏飘了。
+    assert(pace_lo >= 150 && pace_lo <= 260);
+    assert(pace_hi >= pace_lo && pace_hi <= 480);
 
     for (uint8_t lv = 1; lv <= ZG_LEVEL_MAX; lv++) {
         const zg_weapon_t want = GUN_BY_LEVEL[lv];
@@ -820,7 +867,7 @@ static void test_gun_scales_with_level(void)
         if (lv > 1) assert((int)want >= (int)GUN_BY_LEVEL[lv - 1]);
     }
     assert(GUN_BY_LEVEL[1] == ZG_WPN_PEA);
-    assert(GUN_BY_LEVEL[ZG_LEVEL_MAX] == ZG_WPN_RAILGUN);
+    assert(GUN_BY_LEVEL[ZG_LEVEL_MAX] == ZG_WPN_PULSAR);
     // 第 1 关就是单发慢豌豆:开局那一关是留给练走位的,不该一上手就三发。
     assert(zg_weapon_info(ZG_WPN_PEA)->shots == 1);
     assert(zg_weapon_info(ZG_WPN_PEA)->first_level == 1);
@@ -857,14 +904,18 @@ static void test_level_change_is_announced(void)
     assert(g.levelup_ms == 0);
     assert(zg_alive_count(&g) == 1);
 
-    // 封顶:打到第 10 关只亮一次横幅,之后分数再怎么涨都不换关。
+    // 跨过 40 关不是终点:第 41 关照样换关、照样亮横幅,倍数停在 ×6,局继续往下走。
     for (unsigned i = 0; i < ZG_POOL_ZOMBIES; i++) g.zombies[i].alive = false;
-    g.score = (uint32_t)(ZG_LEVEL_MAX - 1u) * ZG_LEVEL_SCORE_STEP;
+    g.reload_ms = 9999;   // 别让自动开火在这几帧里改动分数
+    g.score = (uint32_t)ZG_LEVEL_MAX * ZG_LEVEL_SCORE_STEP;   // 40000 → 第 41 关
+    g.level = ZG_LEVEL_MAX;
+    g.levelup_ms = 0;
+    g.progress_dirty = false;
     zg_step(&g, TICK_MS);
-    assert(g.level == ZG_LEVEL_MAX && g.levelup_ms == ZG_LEVELUP_MS);
-    for (int i = 0; i < 200; i++) step_pure(&g, TICK_MS);
-    assert(g.level == ZG_LEVEL_MAX && g.levelup_ms == 0);
-    assert(zg_alive_count(&g) == 0);   // 倒计时冻住,场上不会自己冒出怪
+    assert(g.phase == ZG_PHASE_PLAY);              // 已经没有"打完"这一档了
+    assert(g.level == ZG_LEVEL_MAX + 1 && g.levelup_ms == ZG_LEVELUP_MS);
+    assert(zg_tier_mul(g.level) == 6);             // 无尽段停在最后一个阶梯
+    assert(g.progress_dirty);                      // 换关照样招呼一次落盘
 
     // 新种类提示只在真的有新怪的那几级出现,UI 靠它决定第二行写什么。
     assert(zg_unlock_at(zg_zombie_info(ZG_Z_JUMPER)->unlock_level) ==
@@ -876,70 +927,63 @@ static void test_level_change_is_announced(void)
     assert(zg_unlock_at(2) == NULL);
     assert(zg_unlock_at(4) == NULL);
     assert(zg_unlock_at(6) == NULL);
-    assert(zg_unlock_at(ZG_LEVEL_MAX) == NULL);   // 第 10 级没有新怪,只有"封顶"
+    assert(zg_unlock_at(ZG_LEVEL_MAX) == NULL);   // 新怪只到第 7 关,后面全是"变强"
+    assert(zg_unlock_at(ZG_LEVEL_MAX + 1) == NULL);
 
-    // 草坪色阶:换档必须落在真的会换关的级别上,而且全程不越界。
-    assert(zg_lawn_group(1) == 0 && zg_lawn_group(3) == 0);
-    assert(zg_lawn_group(4) == 1);
-    assert(zg_lawn_group(7) == 2);
+    // 草坪色阶:一个难度阶梯一档色,换档必须落在真的换关的那一级上,而且全程不越界。
+    assert(zg_lawn_group(1) == 0 && zg_lawn_group(10) == 0);
+    assert(zg_lawn_group(11) == 1);
+    assert(zg_lawn_group(21) == 2);
+    assert(zg_lawn_group(31) == 3);
     assert(zg_lawn_group(ZG_LEVEL_MAX) == ZG_LAWN_GROUPS - 1);
+    // 无尽段不再换草皮:最后一档色一直用下去,UI 才不会跑到第 41 关就无组可取。
+    assert(zg_lawn_group(ZG_LEVEL_MAX + 1) == ZG_LAWN_GROUPS - 1);
     for (uint8_t lv = 1; lv <= ZG_LEVEL_MAX; lv++) assert(zg_lawn_group(lv) < ZG_LAWN_GROUPS);
 }
 
-static void test_clearing_all_levels_wins(void)
+// 无尽:没有通关线。分数一路涨就是关卡一路涨,一局只由"三条命打空"结束。
+// 这条测试钉住的是玩法结论——原来打完第 40 关就发奖章收工,整局被一条分数线判死。
+static void test_endless_has_no_finish_line(void)
 {
     zg_game_t g;
     zg_init(&g, 31, 0);
     to_play(&g);
     g.reload_ms = 9999;
 
-    // 第 10 关:分数已经在 9000~9999 这一档。场上照常有怪,但时间走得再久也不该结束。
-    // 这一条专门钉住"通关看积分而不是看时间"——旧的按时间规则会在这里红。
-    g.elapsed_ms = 600000u;
-    g.score = ZG_WIN_SCORE - 50u;
+    // 原来那条通关线的前一档:场上有怪、时间在走,但没有任何东西把它判成"结束"。
+    g.score = (uint32_t)ZG_LEVEL_SCORE_STEP * ZG_LEVEL_MAX - 50u;
     g.level = zg_level_of_score(g.score);
     assert(g.level == ZG_LEVEL_MAX);
-    place(&g, 0, ZG_Z_SMALL, 100, 60, 0, 0);   // 站住的怪:只用来确认"场上有怪但还没通关"
+    place(&g, 0, ZG_Z_SMALL, 100, 60, 0, 0);   // 站住的怪:用来确认"场上还是照常"
     assert(zg_alive_count(&g) == 1);
     for (int i = 0; i < 100; i++) step_pure(&g, TICK_MS);
     assert(g.phase == ZG_PHASE_PLAY && g.level == ZG_LEVEL_MAX);
-    assert(zg_alive_count(&g) == 1);
+    assert(zg_alive_count(&g) == 1);   // 跨过 40 关不该把场上的怪抹掉
 
-    // 把分数推到通关线,只用一步跨过。
+    // 跨过 40000 分:只是换一关,时间继续走,纪录跟着涨但不立刻招呼写盘。
     const uint32_t elapsed_before = g.elapsed_ms;
-    g.score = ZG_WIN_SCORE;
+    g.progress_dirty = false;
+    g.score = (uint32_t)ZG_LEVEL_SCORE_STEP * ZG_LEVEL_MAX;
     zg_step(&g, TICK_MS);
-    assert(g.phase == ZG_PHASE_WIN);
-    assert(g.level == ZG_LEVEL_MAX);
-    assert(g.levelup_ms == 0);
-    assert(zg_alive_count(&g) == 0);                       // 恭喜画面不留怪
-    assert(!g.items[0].alive && !g.items[1].alive);        // 道具也一起清掉
-    assert(g.hp == ZG_HP_MAX);                             // 通关不该顺手扣血
-    assert(g.best == ZG_WIN_SCORE && g.best_dirty);        // 通关也要把纪录落盘
-
-    // 终局:时间停走、暂停停不了、只有左右键重开能走。
+    assert(g.phase == ZG_PHASE_PLAY);
+    assert(g.level == ZG_LEVEL_MAX + 1 && g.levelup_ms == ZG_LEVELUP_MS);
     assert(g.elapsed_ms == elapsed_before + TICK_MS);
-    for (int i = 0; i < 100; i++) step_pure(&g, TICK_MS);
-    assert(g.phase == ZG_PHASE_WIN && g.elapsed_ms == elapsed_before + TICK_MS);
-    assert(g.score == ZG_WIN_SCORE);
+    assert(g.best == 0 && !g.best_dirty);         // 这一帧没打死东西,就没有新纪录要写
+    assert(g.progress_dirty);                     // 换关只招呼"最远关卡"那一半
+    assert(zg_tier_mul(g.level) == 6);            // 无尽段还落在最后一个阶梯里
+
+    // 进行中的局随时能暂停,左右键也不是重开键:只有打死才会离开 PLAY。
     zg_set_paused(&g, true);
-    assert(!g.paused);                        // 恭喜画面暂停不了,和 GAME OVER 一样
+    assert(g.paused);
     zg_set_paused(&g, false);
     assert(!g.paused);
-    assert(zg_restart(&g));
-    assert(g.phase == ZG_PHASE_READY && g.level == 1 && g.best_dirty);
+    assert(!zg_restart(&g));
+    assert(g.level == ZG_LEVEL_MAX + 1 && g.score == (uint32_t)ZG_LEVEL_SCORE_STEP * ZG_LEVEL_MAX);
 
-    // 奖章只看通关时还剩几条命:一条没丢是金,丢一条银,其余铜。
-    assert(zg_medal_of(ZG_LIVES_MAX) == ZG_MEDAL_GOLD);
-    assert(zg_medal_of(2) == ZG_MEDAL_SILVER);
-    assert(zg_medal_of(1) == ZG_MEDAL_BRONZE);
-    assert(zg_medal_of(0) == ZG_MEDAL_BRONZE);
-    // UI 直接打印档位名,任何一档都不能是空串。
-    for (int m = 0; m < ZG_MEDAL_COUNT; m++) {
-        const char *name = zg_medal_name((zg_medal_t)m);
-        assert(name && name[0]);
-    }
-    assert(zg_medal_name(ZG_MEDAL_NONE) && strcmp(zg_medal_name(ZG_MEDAL_NONE), "NONE") == 0);
+    // 关卡号一路往上数,没有哪一档会停下来:再跨两关还是换关,不是结束。
+    g.score = (uint32_t)ZG_LEVEL_SCORE_STEP * (ZG_LEVEL_MAX + 2u);
+    zg_step(&g, TICK_MS);
+    assert(g.phase == ZG_PHASE_PLAY && g.level == ZG_LEVEL_MAX + 3);
 }
 
 static void test_railgun_pierces_a_column(void)
@@ -948,7 +992,7 @@ static void test_railgun_pierces_a_column(void)
     zg_init(&g, 15, 0);
     to_play(&g);
     // 枪跟着关卡走:要磁轨枪就得打到第 9 关,分数和级别必须一起摆正。
-    g.score = (uint32_t)(ZG_LEVEL_MAX - 2u) * ZG_LEVEL_SCORE_STEP;   // 8000 → 第 9 关
+    g.score = 8u * ZG_LEVEL_SCORE_STEP;                              // 8000 → 第 9 关
     g.level = zg_level_of_score(g.score);
     g.weapon = zg_weapon_for_level(g.level);
     assert(g.level == 9 && g.weapon == ZG_WPN_RAILGUN);
@@ -963,7 +1007,7 @@ static void test_railgun_pierces_a_column(void)
     }
     assert(!g.zombies[0].alive && !g.zombies[1].alive);
     assert(g.kills == 2);
-    assert(g.score >= (uint32_t)(ZG_LEVEL_MAX - 2u) * ZG_LEVEL_SCORE_STEP +
+    assert(g.score >= 8u * ZG_LEVEL_SCORE_STEP +
                        2u * zg_zombie_info(ZG_Z_SMALL)->score);
 }
 
@@ -1178,6 +1222,222 @@ static void test_zombie_backlash_is_late_and_limited(void)
     assert(g.kills == 1);                     // 分身也算打死一只,只是不值那么多分
 }
 
+// 摆一张往下飘的克隆卡片,正下方一只站住的母体,看这一局是被抢(1)还是没抢中(0)。
+// 抢卡只摇一次骰子,所以想要哪一种结果就换种子去挑:这里钉的是"摇完之后的规则",
+// 不是运气本身。返回 -1 表示这一局没走到判定(不该发生)。
+static int card_grab_try(uint32_t seed, uint8_t level)
+{
+    zg_game_t g;
+    zg_init(&g, seed, 0);
+    to_play(&g);
+    g.level = level;
+    g.score = (uint32_t)(level - 1u) * ZG_LEVEL_SCORE_STEP;
+    g.reload_ms = 9999;                       // 本体别开枪,免得母体先被打死
+    place(&g, 0, ZG_Z_SMALL, 100, 60, 0, 0);
+    place_item(&g, 0, ZG_ITEM_CLONE, 100, 40);
+    for (int i = 0; i < 10; i++) {
+        g.reload_ms = 9999;
+        step_pure(&g, TICK_MS);
+        if (g.zombies[0].carded) return 1;
+        if (g.items[0].dodged) return 0;      // 摇过一次没中:卡片继续往下飘
+    }
+    return -1;
+}
+
+// 僵尸也能吃掉下来的克隆卡片:抢中当场多一只分身,并把场上僵尸的复制窗口一起打开,
+// 而玩家一份好处也拿不到;没抢中的那张照常飘下来,走过去仍然接得到。
+static void test_zombie_steals_a_falling_card(void)
+{
+    // 先认"这是概率":同样 100 个种子,既不能全抢到也不能一个都抢不到。
+    int hits_lo = 0, hits_hi = 0;
+    uint32_t hit_seed = 0, miss_seed = 0;
+    for (uint32_t s = 1; s <= 100; s++) {
+        const int r = card_grab_try(s, 1);
+        assert(r >= 0);
+        if (r == 1) { hits_lo++; if (!hit_seed) hit_seed = s; }
+        else if (!miss_seed) miss_seed = s;
+        if (card_grab_try(s, ZG_LEVEL_MAX) == 1) hits_hi++;
+    }
+    assert(hits_lo >= 5 && hits_lo <= 60);
+    assert(hit_seed && miss_seed);
+    // 抢卡概率跟着难度阶梯往上给:最后一个阶梯(六成)必须明显比第一阶梯(两成)抢得多。
+    assert(hits_hi > hits_lo);
+
+    // 抢中的那一局:卡片没了、母体标上"抢过卡"、当场多一只弱化分身、窗口按短的那档打开。
+    zg_game_t g;
+    zg_init(&g, hit_seed, 0);
+    to_play(&g);
+    g.reload_ms = 9999;
+    place(&g, 0, ZG_Z_SMALL, 100, 60, 0, 0);
+    const uint8_t mother_hp = g.zombies[0].hp;
+    place_item(&g, 0, ZG_ITEM_CLONE, 100, 40);
+    for (int i = 0; i < 10 && !g.zombies[0].carded; i++) {
+        g.reload_ms = 9999;
+        step_pure(&g, TICK_MS);
+    }
+    assert(g.zombies[0].carded);
+    assert(!g.items[0].alive);                // 被吃掉的卡片不再是玩家的
+    assert(g.clones == 0 && !g.clone_active);  // 好处归僵尸,玩家这边一株克隆都没有
+    assert(g.learn_ms == 0);                   // 也没有"10 秒后学会"那笔账要记
+    assert(zg_clone_zombie_count(&g) == 1);
+    assert(g.zombies[1].is_clone && g.zombies[1].alive);
+    assert(g.zombies[1].hp == mother_hp / ZG_ZCLONE_HP_DIV);   // 分身是弱化版
+    // 窗口时长用僵尸那一张的(ZG_ZEAT_CLONE_MS),比玩家那张 20 秒短:抢到不等于全盘失控。
+    // 同一帧的窗口计时已经走掉一格,所以这里按"刚到账"的那一小段区间认。
+    assert(g.zclone_ms <= ZG_ZEAT_CLONE_MS && g.zclone_ms > ZG_ZEAT_CLONE_MS - 3 * TICK_MS);
+    assert(g.zclone_ms < ZG_ZOMBIE_CLONE_MS);
+    bool zeat_fx = false;
+    for (unsigned i = 0; i < ZG_POOL_FX; i++) {
+        if (g.fx[i].kind == ZG_FX_ZEAT) zeat_fx = true;
+    }
+    assert(zeat_fx);                           // UI 靠这条写出"卡片被抢了"
+
+    // 母体生过就不再生,窗口关掉之后也不再补:整局只多这一只,不会滚成一片。
+    for (int i = 0; i < ZG_ZEAT_CLONE_MS / TICK_MS + 5; i++) {
+        g.reload_ms = 9999;
+        step_pure(&g, TICK_MS);
+    }
+    assert(g.zclone_ms == 0);
+    assert(zg_clone_zombie_count(&g) == 1);
+
+    // 没抢中的那张:判定只摇一次,之后它继续往下飘,站着不动就能接住。
+    zg_init(&g, miss_seed, 0);
+    to_play(&g);
+    g.reload_ms = 9999;
+    place(&g, 0, ZG_Z_SMALL, 100, 60, 0, 0);
+    place_item(&g, 0, ZG_ITEM_CLONE, 100, 40);
+    for (int i = 0; i < 10 && !g.items[0].dodged; i++) {
+        g.reload_ms = 9999;
+        step_pure(&g, TICK_MS);
+    }
+    assert(g.items[0].dodged && g.items[0].alive);
+    assert(!g.zombies[0].carded && g.zclone_ms == 0 && zg_clone_zombie_count(&g) == 0);
+    for (int i = 0; i < 200 && g.items[0].alive; i++) {
+        g.reload_ms = 9999;
+        step_pure(&g, TICK_MS);
+    }
+    assert(!g.items[0].alive);
+    assert(g.clones == ZG_POOL_CLONES && g.clone_active);   // 接到照旧种下三株
+}
+
+// 第 10 关不是天花板:每 ZG_TIER_LEVELS 关一个难度阶梯,血量/刷怪/抢卡按 1/2/4/6 跳档,
+// 速度单独用一张更缓的表并夹在硬顶之下,枪在阶梯起点跟着换。
+static void test_difficulty_tiers_stack_up(void)
+{
+    assert(ZG_TIER_LEVELS == 10 && ZG_TIER_COUNT == 4);
+    assert(ZG_LEVEL_MAX == ZG_TIER_LEVELS * ZG_TIER_COUNT);
+
+    // 阶梯归属:第 1/11/21/31 关各是一个阶梯的起点,第 40 关仍在最后一档里。
+    assert(zg_tier_of(1) == 0 && zg_tier_of(10) == 0);
+    assert(zg_tier_of(11) == 1 && zg_tier_of(20) == 1);
+    assert(zg_tier_of(21) == 2 && zg_tier_of(30) == 2);
+    assert(zg_tier_of(31) == 3 && zg_tier_of(ZG_LEVEL_MAX) == ZG_TIER_COUNT - 1);
+    // 第 0 关是越界下沿,夹到第一档;99 关则是无尽段的一关,落在最后一档。
+    assert(zg_tier_of(0) == 0 && zg_tier_of(99) == ZG_TIER_COUNT - 1);
+    assert(zg_tier_mul(1) == 1 && zg_tier_mul(11) == 2);
+    assert(zg_tier_mul(21) == 4 && zg_tier_mul(31) == 6);   // UI 直接打印这个数
+    assert(zg_tier_is_head(11) && zg_tier_is_head(21) && zg_tier_is_head(31));
+    assert(!zg_tier_is_head(1) && !zg_tier_is_head(10) && !zg_tier_is_head(15));
+
+    // 血量在换阶梯那一关明显往上跳:1→2、2→4 两跳至少翻倍,4→6 那一跳至少 1.5 倍。
+    // 跳幅比倍数本身略高一点是正常的——阶梯内每 5 关还多给 1 点基础血。
+    assert(zg_zombie_hp(ZG_Z_SMALL, 11) >= 2 * zg_zombie_hp(ZG_Z_SMALL, 10));
+    assert(zg_zombie_hp(ZG_Z_BIG, 21) >= 2 * zg_zombie_hp(ZG_Z_BIG, 20));
+    assert(2 * zg_zombie_hp(ZG_Z_SMALL, 31) >= 3 * zg_zombie_hp(ZG_Z_SMALL, 30));
+    // 无尽段还在继续变厚:第 99 关比第 40 关更硬,直到血被 uint8_t 夹住为止。
+    // 旧的"第 40 关就是天花板"在这里会红——那正是"一局太短"的根因,不该回来。
+    assert(zg_zombie_hp(ZG_Z_SMALL, 99) > zg_zombie_hp(ZG_Z_SMALL, ZG_LEVEL_MAX));
+    assert(zg_zombie_hp(ZG_Z_SMALL, ZG_LEVEL_CEIL) == 255);
+
+    // 速度同样在涨,但用的是另一张更缓的表:六倍血量已经是一堵墙,再乘六倍速度
+    // 就是一屏到底,那不叫难叫看不见。这条是"故意偏离 6 倍"的凭据。
+    assert(zg_tier_vy_mul(1) == 100 && zg_tier_vy_mul(11) == 150);
+    assert(zg_tier_vy_mul(21) == 200 && zg_tier_vy_mul(31) == 250);
+    assert(zg_zombie_vy(ZG_Z_SMALL, 11) > zg_zombie_vy(ZG_Z_SMALL, 10));
+    for (uint8_t lv = 1; lv <= ZG_LEVEL_MAX; lv++) {
+        assert(zg_zombie_vy(ZG_Z_SMALL, lv) <= ZG_ZOMBIE_VY_MAX);
+        assert(zg_zombie_vy(ZG_Z_AMBUSH, lv) <= ZG_ZOMBIE_VY_MAX);
+    }
+
+    // 刷怪跟着阶梯压密,但压到硬底就停:越往后是"更厚 + 更多",不是糊满一屏。
+    assert(zg_spawn_interval_ms(11) < zg_spawn_interval_ms(10));
+    assert(zg_spawn_interval_ms(21) == ZG_SPAWN_MIN_MS);
+    assert(zg_spawn_interval_ms(ZG_LEVEL_MAX) == ZG_SPAWN_MIN_MS);
+    assert(ZG_SPAWN_MIN_MS >= 500);
+
+    // 枪跟着阶梯涨伤害与穿透,克隆豌豆射手也一样:否则后期三株克隆一回合磨不掉一格血。
+    assert(zg_clone_damage(1) == ZG_CLONE_DAMAGE);
+    assert(zg_clone_damage(11) == ZG_CLONE_DAMAGE * 2);
+    assert(zg_clone_damage(ZG_LEVEL_MAX) == ZG_CLONE_DAMAGE * 6);
+
+    // 抢卡概率跟着阶梯往上给,而且永远是个能兑现的百分数。
+    assert(zg_zombie_eat_chance_pct(1) == 20);
+    assert(zg_zombie_eat_chance_pct(11) == 30);
+    assert(zg_zombie_eat_chance_pct(21) == 50);
+    assert(zg_zombie_eat_chance_pct(ZG_LEVEL_MAX) == 60);
+    for (uint8_t lv = 2; lv <= ZG_LEVEL_MAX; lv++) {
+        assert(zg_zombie_eat_chance_pct(lv) >= zg_zombie_eat_chance_pct(lv - 1));
+        assert(zg_zombie_eat_chance_pct(lv) < 100);   // 不是必抢:走位接卡一直有意义
+    }
+}
+
+// 每跨过一关都要留一份能落盘的进度:引擎只标"待存档",写 NVS 归应用层。
+static void test_progress_is_marked_every_level(void)
+{
+    zg_game_t g;
+    zg_init(&g, 7, 0);
+    to_play(&g);
+    assert(!g.progress_dirty);                    // 刚开局没什么要写的
+    g.score = ZG_LEVEL_SCORE_STEP;                // 刚好跨过第二关
+    zg_step(&g, TICK_MS);
+    assert(g.level == 2 && g.progress_dirty);
+    g.progress_dirty = false;                     // 应用层写盘之后清标记
+    // 同一关里再怎么涨分都不该重复写:Flash 的擦写次数不是无限的。
+    g.score = 2u * ZG_LEVEL_SCORE_STEP - 1u;
+    zg_step(&g, TICK_MS);
+    assert(g.level == 2 && !g.progress_dirty);
+    // 再跨一关又标一次,枪跟着换到那一档。
+    g.score = 2u * ZG_LEVEL_SCORE_STEP;
+    zg_step(&g, TICK_MS);
+    assert(g.level == 3 && g.progress_dirty);
+    assert(g.weapon == zg_weapon_for_level(3));
+
+    // 无尽段没有"最后一格":第 40 关之后每跨一关照样标一次,待遇完全一样。
+    g.progress_dirty = false;
+    g.score = (uint32_t)ZG_LEVEL_SCORE_STEP * ZG_LEVEL_MAX;
+    zg_step(&g, TICK_MS);
+    assert(g.phase == ZG_PHASE_PLAY && g.level == ZG_LEVEL_MAX + 1 && g.progress_dirty);
+
+    // 重开不写进度:纪录里的"最远关卡"是纪录,新局的第 1 关不该把它抹掉。
+    // 打死那条路由 test_ten_hp_three_lives_then_game_over 覆盖,这里只关心重开的账。
+    g.progress_dirty = false;
+    g.phase = ZG_PHASE_OVER;
+    assert(zg_restart(&g));
+    assert(!g.progress_dirty && g.score == 0 && g.level == 1);
+}
+
+// 开机永远从第一关起:读回来的纪录只当比较基准,不当断点。
+// 这条替掉了旧的"从存档分数接着打"—— 无尽模式没有位置可以续,能续的只有纪录。
+static void test_boot_starts_at_level_one(void)
+{
+    zg_game_t g;
+    zg_init(&g, 9, 12345u);                        // 历史最高分 12345
+    assert(g.phase == ZG_PHASE_READY);
+    assert(g.score == 0 && g.level == 1);          // 分数再高也不把位置回放回来
+    assert(g.best == 12345u);                      // 纪录留着做 HI 显示和破纪录比较
+    assert(g.weapon == ZG_WPN_PEA);                // 枪跟着关卡走:第 1 关就是最慢那颗豌豆
+    assert(g.hp == ZG_HP_MAX && g.lives == ZG_LIVES_MAX);
+    assert(!g.best_dirty && !g.progress_dirty);    // 读回来的东西不用再写一遍
+    assert(g.spawn_ms == zg_spawn_interval_ms(1));
+    assert(g.item_ms == ZG_ITEM_FIRST_MS);
+
+    // 打死之后重开是同一件事:回到第一关,纪录一个字都不动。
+    g.phase = ZG_PHASE_OVER;
+    assert(zg_restart(&g));
+    assert(g.level == 1 && g.score == 0 && g.best == 12345u);
+    assert(!g.progress_dirty && !g.best_dirty);
+}
+
 static void test_spawn_pool_and_bounds(void)
 {
     zg_game_t g;
@@ -1264,6 +1524,7 @@ static uint32_t checksum(const zg_game_t *g)
         (uint32_t)g->item_ms, (uint32_t)g->rapid_ms, (uint32_t)g->bonus_shots,
         (uint32_t)g->clone_active, (uint32_t)g->clones, (uint32_t)g->learn_ms,
         (uint32_t)g->zclone_ms, (uint32_t)g->clone_reload_ms[0],
+        (uint32_t)g->zclone_step_ms, (uint32_t)g->progress_dirty,
         (uint32_t)g->move_dir, (uint32_t)g->hold_ms, g->rng,
     };
     for (unsigned i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
@@ -1274,7 +1535,8 @@ static uint32_t checksum(const zg_game_t *g)
         h = (h ^ (uint32_t)z->alive ^ ((uint32_t)z->x << 3) ^ ((uint32_t)z->y << 5) ^
              ((uint32_t)z->hp << 7) ^ ((uint32_t)z->type << 11) ^
              ((uint32_t)z->airborne << 13) ^ ((uint32_t)z->telegraph_ms << 17) ^
-             ((uint32_t)z->is_clone << 23) ^ ((uint32_t)z->cloned << 24)) * 16777619u;
+             ((uint32_t)z->is_clone << 23) ^ ((uint32_t)z->cloned << 24) ^
+             ((uint32_t)z->carded << 25)) * 16777619u;
     }
     for (unsigned i = 0; i < ZG_POOL_BULLETS; i++) {
         const zg_bullet_t *b = &g->bullets[i];
@@ -1284,7 +1546,7 @@ static uint32_t checksum(const zg_game_t *g)
     for (unsigned i = 0; i < ZG_POOL_ITEMS; i++) {
         const zg_item_t *it = &g->items[i];
         h = (h ^ (uint32_t)it->alive ^ ((uint32_t)it->x << 3) ^ ((uint32_t)it->y << 5) ^
-             ((uint32_t)it->kind << 9)) * 16777619u;
+             ((uint32_t)it->kind << 9) ^ ((uint32_t)it->dodged << 11)) * 16777619u;
     }
     return h;
 }
@@ -1343,10 +1605,14 @@ int main(void)
     test_gun_scales_with_level();
     test_level_change_is_announced();
     test_items_are_caught_by_walking();
-    test_clearing_all_levels_wins();
+    test_endless_has_no_finish_line();
     test_railgun_pierces_a_column();
     test_clone_card_plants_three_shooters();
     test_zombie_backlash_is_late_and_limited();
+    test_zombie_steals_a_falling_card();
+    test_difficulty_tiers_stack_up();
+    test_progress_is_marked_every_level();
+    test_boot_starts_at_level_one();
     test_spawn_pool_and_bounds();
     test_same_seed_same_round();
     puts("zombie shooter engine tests: PASS");
