@@ -4,8 +4,10 @@
 //
 // 玩法:竖屏顶视。花盆里的豌豆射手守着屏幕底边,只能左右移动;僵尸从上方往下压,
 // 射手自动朝上吐豌豆。僵尸被打死就得分,分数每满一档就换下一关(共 10 关),
-// 换关时亮横幅并在横幅期间停刷怪。天上还会掉下道具:接到就是射速翻倍 20 秒,
-// 或者一次多吐一颗豌豆(整场最多 4 颗)。
+// 换关时亮横幅并在横幅期间停刷怪。天上还会掉下道具:接到就是射速翻倍 20 秒、
+// 一次多吐一颗豌豆(整场最多 4 颗),或者一张克隆卡片。
+// 克隆卡片当场在草坪底边种出 3 个克隆豌豆射手,各自吐豌豆打僵尸,一直打到这一条命
+// 打完;代价是 10 秒后僵尸也学会克隆,在随后 20 秒里每只僵尸复制一个血量减半的分身。
 // 僵尸漏到底边或撞到豌豆射手都扣 1 点血,10 点血扣光丢 1 条命,3 条命丢光结束。
 // 分数打满第 10 关就是通关:游戏结束,按剩余命数发奖章,和 GAME OVER 一样等一次按键重开。
 #pragma once
@@ -16,8 +18,11 @@
 // ---- 场地与资源上限(固定池,无动态分配) ----
 #define ZG_FIELD_W        240   // 与 BSP_LCD_W 一致
 #define ZG_FIELD_H        250   // 屏幕扣掉 HUD 与底部提示后的可玩高度
-#define ZG_POOL_ZOMBIES     6   // 同屏最多几只僵尸
-#define ZG_POOL_BULLETS    10   // 同屏最多几颗子弹
+// 僵尸池分两层:刷怪只按 ZG_SPAWN_CAP 走(难度曲线靠它),多出来的名额专门留给
+// 克隆卡片的反噬——否则"僵尸也会复制"在后期一只都塞不进来,等于没有缺点。
+#define ZG_POOL_ZOMBIES     8   // 同屏最多几只僵尸(含分身)
+#define ZG_SPAWN_CAP        6   // 正常刷怪的同屏上限
+#define ZG_POOL_BULLETS    14   // 同屏最多几颗子弹(克隆射手也要占弹道)
 #define ZG_POOL_FX          8   // 同屏最多几个特效
 #define ZG_POOL_ITEMS       2   // 同屏最多几个道具(多了读不过来,也接不完)
 
@@ -29,15 +34,17 @@
 #define ZG_POS_TO_PX(v)     ((int16_t)((v) >> ZG_POS_SHIFT))
 #define ZG_PX_TO_POS(px)    ((int32_t)(px) << ZG_POS_SHIFT)
 
-#define ZG_PLAYER_W        16
-#define ZG_PLAYER_H        26
+// 精灵整体比初版放大约 1.5 倍:240x250 的场地上 16x26 的射手和 12x14 的僵尸
+// 在手里那块小屏上几乎看不清在打谁。放大只动碰撞盒与画法,不动速度/血量。
+#define ZG_PLAYER_W        24
+#define ZG_PLAYER_H        38
 #define ZG_PLAYER_SPEED   150   // 刚按下左右键时的移动速度,px/s
 // 只有一个移动键可用,所以把"按住时长"当成第二个档位:同一个方向连续按满
 // ZG_SPRINT_MS 就翻倍。点按仍能微调站位,长按用来赶路/救场。
 #define ZG_SPRINT_MS      500
 #define ZG_SPRINT_MUL       2
-#define ZG_BULLET_W         3
-#define ZG_BULLET_H         8
+#define ZG_BULLET_W         4
+#define ZG_BULLET_H        10
 // 弹速不在这里定,而是每档枪各带一个 bullet_speed:开局那颗豌豆慢,升档才变快。
 
 // ---- 节奏与判定门限 ----
@@ -62,7 +69,7 @@
 // ---- 道具 ----
 // 道具从屏幕上方飘下来,靠左右走位去接;漏了没有任何惩罚,接到才有效。
 // 间隔随关卡收紧,所以越往后越是"顺手就能拿到强化",压力主要来自怪的数量。
-#define ZG_ITEM_SIZE         14  // 碰撞盒与绘制尺寸一致
+#define ZG_ITEM_SIZE         18  // 碰撞盒与绘制尺寸一致(卡片按这个宽度竖着画)
 #define ZG_ITEM_VY           55  // 下落速度 px/s:比最快的僵尸慢,追得上也接得住
 #define ZG_ITEM_FIRST_MS   8000  // 开局第一件道具出现的时间
 #define ZG_ITEM_STEP_MS   12000  // 之后每隔这么久掉一件
@@ -70,6 +77,26 @@
 #define ZG_RAPID_MS      20000   // 射速翻倍持续 20 秒
 #define ZG_RAPID_DIV         2   // 20 秒内开火间隔按 1/2 算
 #define ZG_MAX_SHOTS         4   // 一次最多吐几颗豌豆(道具加成的硬顶)
+
+// ---- 克隆卡片 ----
+// 接到卡片:草坪底边当场长出 3 个克隆豌豆射手,各自独立吐豌豆,直到这一条命打完
+// (丢命连带清掉,反噬也一起取消——不能让人挨了惩罚却没拿到好处)。
+// 卡片的代价:接住 10 秒后僵尸学会同一招,在随后 20 秒里每只僵尸复制一个分身。
+#define ZG_POOL_CLONES         3  // 一张卡片最多同时有几个克隆射手
+#define ZG_CLONE_W            20
+#define ZG_CLONE_H            30
+#define ZG_CLONE_SLOT_STEP   100  // 三个克隆等间距钉在底边,第一个从这一列起
+#define ZG_CLONE_SLOT_X0       8
+#define ZG_CLONE_FIRE_MS    1100  // 单个克隆的开火间隔:3 个加起来约等于第二把枪
+#define ZG_CLONE_SHOTS         1  // 克隆一次只吐一颗直上直下的豌豆
+#define ZG_CLONE_DAMAGE        1  // 比本体低一档,升枪的收益仍然归本体
+#define ZG_CLONE_SPEED      260   // 克隆的豌豆弹速 px/s
+#define ZG_CLONE_STAGGER_MS 260  // 三个克隆错开相位,避免每 1.1 秒同步齐射
+#define ZG_ZOMBIE_LEARN_MS 10000 // 接住卡片到僵尸学会克隆之间的空窗
+#define ZG_ZOMBIE_CLONE_MS 20000 // 学会之后持续复制这么久
+#define ZG_ZOMBIE_CLONE_STEP_MS 3000  // 复制窗口里每隔这么久放出一只分身
+#define ZG_ZCLONE_HP_DIV        2     // 分身血量按母体剩余血量的一半算
+#define ZG_ZCLONE_SCORE_DIV     2     // 分身分值同样减半:它不该比本体值钱
 
 typedef enum {
     ZG_PHASE_READY = 0,   // 开局或刚丢命:短暂的 "GET READY",不生成也不判定
@@ -101,11 +128,12 @@ typedef struct {
     uint8_t first_level;   // 从第几关起手里是这一档
 } zg_weapon_info_t;
 
-// 道具类型。只有两种,但效果一个是即时、一个是持续到接住那一刻起 20 秒,
-// 玩家不需要认字也能感觉出"现在吐得不一样"。
+// 道具类型。前两种是纯收益,第三种是"收益 + 延后到账的代价":卡片当场给 3 个克隆
+// 射手,但 10 秒后僵尸也开始复制。玩家不需要认字,只要那 10 秒里看见草坪两侧多了自己。
 typedef enum {
     ZG_ITEM_RAPID = 0,    // 射速翻倍,持续 ZG_RAPID_MS
     ZG_ITEM_PEA,          // 一次多吐一颗豌豆,最多加满 ZG_MAX_SHOTS 颗
+    ZG_ITEM_CLONE,        // 克隆 3 个豌豆射手,反噬见 ZG_ZOMBIE_* 一组常量
     ZG_ITEM_COUNT
 } zg_item_kind_t;
 
@@ -151,6 +179,9 @@ typedef enum {
     ZG_FX_HURT,           // 豌豆射手挨了一下
     ZG_FX_GUNUP,          // 豌豆枪跟着关卡升档
     ZG_FX_PICKUP,         // 接到道具
+    ZG_FX_CLONE,          // 卡片生效横幅:草坪上多了 3 株克隆射手(只出字,不画点)
+    ZG_FX_ZCLONE,         // 一只分身落地时的那圈
+    ZG_FX_ZLEARN,         // 反噬到账横幅:僵尸学会克隆了(只出字,不画点)
     ZG_FX_KIND_COUNT
 } zg_fx_kind_t;
 
@@ -166,6 +197,8 @@ typedef struct {
     uint16_t hop_ms;             // 跳跃僵尸:本次腾空剩余时间
     uint16_t wait_ms;            // 跳跃僵尸:落地蓄力剩余时间
     bool airborne;               // 腾空:子弹直接穿过
+    bool is_clone;               // 卡片反噬复制出来的分身:血与分都按母体减半
+    bool cloned;                 // 已经产过分身,不再当母体(否则 20 秒里会滚成一片)
     bool alive;
     zg_zombie_type_t type;
 } zg_zombie_t;
@@ -209,6 +242,13 @@ typedef struct {
     uint16_t item_ms;            // 下一个道具的掉落倒计时
     uint16_t rapid_ms;           // 射速翻倍剩余时间,0 = 没吃到加速道具
     uint8_t bonus_shots;         // 道具累计的额外豌豆数,和档位发数合起来不超过 ZG_MAX_SHOTS
+    // ---- 克隆卡片 ----
+    bool clone_active;           // 这张卡片的一整段效果(己方克隆 + 僵尸反噬)还在走
+    uint8_t clones;              // 场上有几个克隆豌豆射手
+    uint16_t clone_reload_ms[ZG_POOL_CLONES];  // 各克隆的开火倒计时:错相位才不会齐射
+    uint16_t learn_ms;           // 僵尸学会克隆还剩多久(接住卡片起 10 秒)
+    uint16_t zclone_ms;          // 僵尸复制窗口剩余时间,0 = 当前不在复制
+    uint16_t zclone_step_ms;     // 复制窗口内下一次放分身的时间
     int8_t move_dir;             // -1 左 / 0 停 / +1 右
     uint16_t hold_ms;            // 当前方向已连续按住多久,饱和在 ZG_SPRINT_MS
     bool key_left;
@@ -271,6 +311,12 @@ bool zg_zombie_hits_player(const zg_game_t *game, const zg_zombie_t *zombie);
 bool zg_bullet_hits_zombie(const zg_bullet_t *bullet, const zg_zombie_t *zombie);
 bool zg_item_hits_player(const zg_game_t *game, const zg_item_t *item);
 int zg_alive_count(const zg_game_t *game);
+// 卡片反噬复制出来的分身有几只:非分身数量仍受 ZG_SPAWN_CAP 管,分身只吃池子余量。
+int zg_clone_zombie_count(const zg_game_t *game);
+// 第 idx 个克隆豌豆射手的左上角(px)。克隆种在底边固定三列,跟着场地走而不是跟人走,
+// 所以想保住某一路就得自己站过去——UI 和引擎都从这一个函数取坐标。
+int16_t zg_clone_x(uint8_t idx);
+int16_t zg_clone_y(void);
 
 // ---- 通关奖励 ----
 // 打完 10 关必发奖章,等级只看还剩几条命:通关时一条没丢就是金,丢一条银,

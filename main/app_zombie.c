@@ -68,6 +68,7 @@ static const char *TAG = "z_app";
 #define COL_LINE      0xE3D9A0      // 底边防线:一块压平的石板路
 #define COL_SPAWN     0xD9B25A      // 突袭僵尸现身的那圈土
 #define COL_EYE       0x24331C      // 僵尸眼窝
+#define COL_CARD_FRM  0xF2E6C0      // 克隆卡片那一圈浅色卡边
 
 // 草坪色阶:每档对应一次换关(1/4/7/10 级),草越往后越暗,和"上午→傍晚"一个走向。
 // 索引是 zg_lawn_group(level),第一档必须等于上面的 COL_FIELD / COL_FIELD_ALT。
@@ -148,6 +149,8 @@ static lv_obj_t *s_medal_label;
 static lv_obj_t *s_player;
 static lv_obj_t *s_leaf_l;
 static lv_obj_t *s_leaf_r;
+static lv_obj_t *s_clone_view[ZG_POOL_CLONES];   // 卡片克隆出的豌豆射手
+static bool s_clone_shown[ZG_POOL_CLONES];       // 上一次上屏状态,只在该帧切换
 static zview_t s_zview[ZG_POOL_ZOMBIES];
 static lv_obj_t *s_bullet_view[ZG_POOL_BULLETS];
 static fxview_t s_fx_view[ZG_POOL_FX];
@@ -156,6 +159,9 @@ static itemview_t s_item_view[ZG_POOL_ITEMS];
 static bool s_level_bar_on;
 static uint8_t s_level_shown;
 static uint8_t s_lawn_shown = 0xFF;
+// 横幅文字同理:记录上一次写的是哪一条(-1 = 没亮)。界面是每次 start 新建的,
+// 所以 ui_build 里要把它打回 -1,否则重建后第一条横幅会被当成"没变化"而漏写。
+static int8_t s_banner_shown = -1;
 static bool s_win_logged;   // 通关日志只打一次,重开时清掉
 
 static lv_timer_t *s_timer;
@@ -241,17 +247,39 @@ static lv_obj_t *add_group(lv_obj_t *parent, int32_t w, int32_t h)
     return group;
 }
 
-// ---- 豌豆射手(16 x 26 容器,炮口朝上对着压下来的僵尸) ----
+// ---- 豌豆射手(24 x 38 容器,炮口朝上对着压下来的僵尸) ----
+// 部件坐标按 ZG_PLAYER_W/H 摆,改引擎尺寸而没重画这里,炮口就会和弹道错开。
+_Static_assert(ZG_PLAYER_W == 24 && ZG_PLAYER_H == 38,
+               "build_player 的部件坐标钉在 24x38,改尺寸要重画一遍");
 static void build_player(void)
 {
     s_player = add_group(s_field, ZG_PLAYER_W, ZG_PLAYER_H);
-    add_box(s_player, 7, 11, 2, 8, COL_STALK, 0);           // 茎
-    s_leaf_l = add_box(s_player, 1, 13, 6, 3, COL_LEAF, 2); // 两片叶:移动时错开摆动
-    s_leaf_r = add_box(s_player, 9, 11, 6, 3, COL_LEAF, 2);
-    add_box(s_player, 4, 19, 8, 7, COL_POT, 2);             // 花盆
-    add_box(s_player, 3, 18, 10, 3, COL_POT_RIM, 1);        // 盆沿
-    add_box(s_player, 3, 3, 10, 10, COL_HEAD, LV_RADIUS_CIRCLE);   // 脑袋
-    add_box(s_player, 6, 0, 4, 5, COL_SNOUT, 2);            // 炮口:子弹判定盒正上方
+    add_box(s_player, 11, 17, 2, 9, COL_STALK, 0);            // 茎
+    s_leaf_l = add_box(s_player, 1, 20, 9, 4, COL_LEAF, 2);   // 两片叶:移动时错开摆动
+    s_leaf_r = add_box(s_player, 14, 18, 9, 4, COL_LEAF, 2);
+    add_box(s_player, 5, 27, 14, 11, COL_POT, 2);             // 花盆
+    add_box(s_player, 3, 25, 18, 4, COL_POT_RIM, 1);          // 盆沿
+    add_box(s_player, 4, 5, 16, 16, COL_HEAD, LV_RADIUS_CIRCLE);  // 脑袋
+    add_box(s_player, 9, 0, 6, 6, COL_SNOUT, 2);              // 炮口:子弹判定盒正上方
+}
+
+// ---- 克隆豌豆射手(卡片给的,种在底边固定三列) ----
+// 比本体小一号、只画"盆 + 脑袋 + 炮口"三块:同屏可能和本体并存 4 株,部件越少
+// 越能分清谁是谁,LVGL 静态池也少十几个对象。
+static void build_clones(void)
+{
+    for (unsigned i = 0; i < ZG_POOL_CLONES; i++) {
+        lv_obj_t *g = add_group(s_field, ZG_CLONE_W, ZG_CLONE_H);
+        // 位子取自引擎的同一套槽位函数:弹道起点画在哪儿,豌豆就从哪儿出膛。
+        lv_obj_set_pos(g, zg_clone_x((uint8_t)i), zg_clone_y());
+        add_box(g, 5, 22, 10, 8, COL_POT, 2);
+        add_box(g, 3, 20, 14, 3, COL_POT_RIM, 1);
+        add_box(g, 3, 5, 12, 12, COL_HEAD, LV_RADIUS_CIRCLE);
+        add_box(g, 7, 1, 5, 5, COL_SNOUT, 2);
+        set_visible(g, false);
+        s_clone_view[i] = g;
+        s_clone_shown[i] = false;
+    }
 }
 
 // ---- 僵尸槽位 ----
@@ -259,14 +287,14 @@ static void build_zombies(void)
 {
     for (unsigned i = 0; i < ZG_POOL_ZOMBIES; i++) {
         zview_t *v = &s_zview[i];
-        v->box = add_group(s_field, 12, 14);
+        v->box = add_group(s_field, 18, 21);
         lv_obj_set_style_border_color(v->box, lv_color_hex(0x1A2A12), 0);
         lv_obj_set_style_border_opa(v->box, LV_OPA_50, 0);
-        v->torso = add_box(v->box, 1, 6, 10, 6, Z_BODY[0], 2);
-        v->arm_l = add_box(v->box, 0, 8, 3, 5, Z_ARM, 1);
-        v->arm_r = add_box(v->box, 9, 8, 3, 5, Z_ARM, 1);
-        v->head = add_box(v->box, 3, 0, 7, 7, Z_HEAD[0], LV_RADIUS_CIRCLE);
-        v->eye = add_box(v->box, 4, 2, 2, 2, COL_EYE, 1);
+        v->torso = add_box(v->box, 1, 9, 16, 10, Z_BODY[0], 2);
+        v->arm_l = add_box(v->box, 0, 14, 4, 7, Z_ARM, 1);
+        v->arm_r = add_box(v->box, 14, 14, 4, 7, Z_ARM, 1);
+        v->head = add_box(v->box, 4, 0, 11, 11, Z_HEAD[0], LV_RADIUS_CIRCLE);
+        v->eye = add_box(v->box, 6, 4, 3, 3, COL_EYE, 1);
         v->look = -1;
         v->shown = false;
         set_visible(v->box, false);
@@ -276,8 +304,9 @@ static void build_zombies(void)
 static void build_bullets(void)
 {
     for (unsigned i = 0; i < ZG_POOL_BULLETS; i++) {
-        // 画成一颗圆豌豆:判定盒仍是 3 x 8,视觉比判定略宽一点不影响手感。
-        s_bullet_view[i] = add_box(s_field, 0, 0, 5, 5, COL_PEA, LV_RADIUS_CIRCLE);
+        // 画成一颗圆豌豆:判定盒是 4 x 10,视觉画成 8 x 8 的圆,比判定略宽一点
+        // 不影响手感,但 240x250 的屏上 5px 的豆几乎是一粒噪点。
+        s_bullet_view[i] = add_box(s_field, 0, 0, 8, 8, COL_PEA, LV_RADIUS_CIRCLE);
         set_visible(s_bullet_view[i], false);
     }
 }
@@ -293,14 +322,14 @@ static void build_fx(void)
     }
 }
 
-// 道具:一个圆角盒 + 中心一块小方块。中心那块横着画是"多一颗豌豆"(和炮口同向),
-// 竖着画是"吐得更快",两个剪影不认字也分得开。
+// 道具:一个圆角盒 + 中心一块小记号。竖着一道是"吐得更快",横着一道是"多一颗豌豆",
+// 框中框是"克隆卡片"——三个剪影不认字也分得开,配色再兜一层底。
 static void build_items(void)
 {
     for (unsigned i = 0; i < ZG_POOL_ITEMS; i++) {
         itemview_t *v = &s_item_view[i];
         v->box = add_box(s_field, 0, 0, ZG_ITEM_SIZE, ZG_ITEM_SIZE, COL_GOLD, 4);
-        v->mark = add_box(v->box, 3, 5, 8, 4, COL_BG, 1);
+        v->mark = add_box(v->box, 4, 7, 10, 4, COL_BG, 1);
         v->kind = -1;
         v->shown = false;
         set_visible(v->box, false);
@@ -343,6 +372,7 @@ static void ui_build(void)
     lv_obj_set_style_border_width(s_field, 1, 0);
     lv_obj_set_style_border_color(s_field, lv_color_hex(COL_FRAME), 0);
 
+    build_clones();     // 先建克隆射手:本体走在它们上面才像"一排在草坪上"
     build_player();
     build_zombies();
     build_bullets();
@@ -367,12 +397,13 @@ static void ui_build(void)
     // 摆在 SCORE 那行下面,开局/暂停/结束三种"场上没东西"的画面都放得下。
     s_help_label = add_label(s_field, 0, 122, &lv_font_montserrat_14, COL_TEXT,
                              LV_TEXT_ALIGN_CENTER, ZG_FIELD_W);
+    // 仍然只有 5 行:说明卡底边要留给站在最下面的射手,第 6 行会直接压在炮口上。
     lv_label_set_text(s_help_label,
-                      "UP / DOWN   MOVE\n"
-                      "KEEP HOLD   2X SPEED\n"
-                      "OK HOLD     PAUSE\n"
-                      "OK TAP      RESUME\n"
-                      "GIFTS FALL  WALK UNDER");
+                      "UP / DOWN    MOVE\n"
+                      "KEEP HOLD    2X SPEED\n"
+                      "OK HOLD PAUSE  TAP RESUME\n"
+                      "GIFTS FALL   WALK UNDER\n"
+                      "CARD CLONES  3 PEAS");
     lv_obj_align(s_help_label, LV_ALIGN_TOP_MID, 0, 122);
     // 换关横幅:一条压暗的横带 + 级别 + 这一级新登场的那只僵尸。引擎在这 1.8 秒里
     // 不会刷出新怪,所以这条横幅一定读得完,不会被扑下来的僵尸打断。
@@ -401,6 +432,7 @@ static void ui_build(void)
                               LV_TEXT_ALIGN_CENTER, ZG_FIELD_W);
     lv_obj_align(s_medal_label, LV_ALIGN_TOP_MID, 0, 176);
     set_visible(s_ready_label, false);
+    s_banner_shown = -1;   // 横幅是新建的对象,上一局的"已经写过哪条"不算数
     set_visible(s_banner, false);
     set_visible(s_help_label, false);
     set_visible(s_over_label, false);
@@ -422,7 +454,8 @@ static void ui_build(void)
 static int16_t zombie_look(const zg_zombie_t *z)
 {
     return (int16_t)((int)z->type * 16 + (z->airborne ? 8 : 0) +
-                     (z->telegraph_ms > 0 ? 4 : 0) + (z->flash_ms > 0 ? 2 : 0));
+                     (z->telegraph_ms > 0 ? 4 : 0) + (z->flash_ms > 0 ? 2 : 0) +
+                     (z->is_clone ? 1 : 0));
 }
 
 static void zview_apply(zview_t *v, const zg_zombie_t *z)
@@ -431,7 +464,10 @@ static void zview_apply(zview_t *v, const zg_zombie_t *z)
     const int32_t w = air ? z->w + 6 : z->w;      // 腾空时放大,读出"扑过来"
     const int32_t h = air ? z->h + 6 : z->h;
     const bool ghost = (z->telegraph_ms > 0);     // 突袭僵尸现身的一瞬是半透明的
-    const lv_opa_t opa = ghost ? LV_OPA_50 : LV_OPA_COVER;
+    // 分身画淡一档再描一圈卡片的紫:一眼看得出"这是刚复制出来的那半只",
+    // 而不是场上莫名多了一只同型的怪。
+    const bool dup = z->is_clone;
+    const lv_opa_t opa = ghost ? LV_OPA_50 : (dup ? LV_OPA_70 : LV_OPA_COVER);
     const bool hit = (z->flash_ms > 0);
     // 头一律是"帽色"(普通僵尸是皮肤,铁桶是铁皮,路障是橙色路障),被打中就整只泛白。
     const uint32_t head_col = hit ? 0xFFFFFF : Z_HEAD[z->type];
@@ -465,7 +501,10 @@ static void zview_apply(zview_t *v, const zg_zombie_t *z)
     lv_obj_set_size(v->arm_r, arm_w, arm_h);
     lv_obj_set_style_bg_color(v->arm_r, lv_color_hex(arm_col), 0);
     lv_obj_set_style_bg_opa(v->arm_r, opa, 0);
-    lv_obj_set_style_border_width(v->box, air ? 1 : 0, 0);
+    lv_obj_set_style_border_width(v->box, (air || dup) ? 1 : 0, 0);
+    lv_obj_set_style_border_color(v->box, lv_color_hex(dup ? zg_item_info(ZG_ITEM_CLONE)->color
+                                                           : 0x1A2A12), 0);
+    lv_obj_set_style_border_opa(v->box, dup ? LV_OPA_COVER : LV_OPA_50, 0);
 }
 
 static void render_zombies(void)
@@ -506,9 +545,21 @@ static void render_bullets(void)
             if (obj) set_visible(obj, false);
             continue;
         }
-        lv_obj_set_x(obj, ZG_POS_TO_PX(b->x) - 1);
+        // 8px 的圆压在 4x10 判定盒的中心上:横向外扩 2px、纵向对齐豆心。
+        lv_obj_set_x(obj, ZG_POS_TO_PX(b->x) - 2);
         lv_obj_set_y(obj, ZG_POS_TO_PX(b->y) + 1);
         set_visible(obj, true);
+    }
+}
+
+// 克隆射手:引擎把位子钉死在底边三列,这里只切可见性,不逐帧改样式。
+static void render_clones(void)
+{
+    for (unsigned i = 0; i < ZG_POOL_CLONES; i++) {
+        const bool on = (i < s_game.clones) && (s_game.phase == ZG_PHASE_PLAY || s_game.paused);
+        if (on == s_clone_shown[i]) continue;
+        s_clone_shown[i] = on;
+        set_visible(s_clone_view[i], on);
     }
 }
 
@@ -529,12 +580,26 @@ static void render_items(void)
         lv_obj_set_x(v->box, ZG_POS_TO_PX(it->x));
         lv_obj_set_y(v->box, ZG_POS_TO_PX(it->y));
         if ((int8_t)it->kind != v->kind) {
-            const bool rapid = (it->kind == ZG_ITEM_RAPID);
-            v->kind = (int8_t)it->kind;
-            lv_obj_set_style_bg_color(v->box, lv_color_hex(zg_item_info(it->kind)->color), 0);
-            // 加速:竖着一道(往下冲的意思);加豆:横着一道(一次多吐一颗)。
-            lv_obj_set_pos(v->mark, rapid ? 5 : 3, rapid ? 3 : 5);
-            lv_obj_set_size(v->mark, rapid ? 4 : 8, rapid ? 8 : 4);
+            const zg_item_kind_t kind = it->kind;
+            v->kind = (int8_t)kind;
+            lv_obj_set_style_bg_color(v->box, lv_color_hex(zg_item_info(kind)->color), 0);
+            if (kind == ZG_ITEM_CLONE) {
+                // 卡片:一圈浅色卡边 + 中间一个"框中框"。框中框就是"复制"这件事本身,
+                // 配上全场唯一的紫色,不认字也分得清它和另外两件不一样。
+                lv_obj_set_style_border_width(v->box, 2, 0);
+                lv_obj_set_style_border_color(v->box, lv_color_hex(COL_CARD_FRM), 0);
+                lv_obj_set_style_border_opa(v->box, LV_OPA_COVER, 0);
+                lv_obj_set_pos(v->mark, 5, 5);
+                lv_obj_set_size(v->mark, 8, 8);
+                lv_obj_set_style_radius(v->mark, 3, 0);
+            } else {
+                const bool rapid = (kind == ZG_ITEM_RAPID);
+                lv_obj_set_style_border_width(v->box, 0, 0);
+                // 加速:竖着一道(往下冲的意思);加豆:横着一道(一次多吐一颗)。
+                lv_obj_set_pos(v->mark, rapid ? 7 : 4, rapid ? 4 : 7);
+                lv_obj_set_size(v->mark, rapid ? 4 : 10, rapid ? 10 : 4);
+                lv_obj_set_style_radius(v->mark, 1, 0);
+            }
         }
         if (!v->shown) {
             set_visible(v->box, true);
@@ -546,7 +611,9 @@ static void render_items(void)
 // 特效按 ttl 算透明度和大小:引擎负责寿命,UI 掉一帧也不会漏动画。
 static void render_fx(void)
 {
-    bool banner = false;
+    bool gun = false;
+    bool clone = false;
+    bool zlearn = false;
     for (unsigned i = 0; i < ZG_POOL_FX; i++) {
         fxview_t *v = &s_fx_view[i];
         const zg_fx_t *fx = &s_game.fx[i];
@@ -560,30 +627,41 @@ static void render_fx(void)
         }
         const uint32_t percent = (uint32_t)(fx->ttl_ms * 100u / (fx->life_ms ? fx->life_ms : 1));
         const int32_t fade = (int32_t)(255u * percent / 100u);
-        int32_t size = 6;
+        int32_t size = 8;
         uint32_t color = COL_GOLD;
         bool ring = false;
+        bool text_only = false;
 
         switch (fx->kind) {
         case ZG_FX_MUZZLE:
-            size = 6; color = 0xD9F58A; break;      // 炮口那一下:亮绿的豆光
+            size = 8; color = 0xD9F58A; break;      // 炮口那一下:亮绿的豆光
         case ZG_FX_HIT:
-            size = 5; color = 0xFFFFFF; break;
+            size = 7; color = 0xFFFFFF; break;
         case ZG_FX_DEATH:
             // 僵尸被打散是一撮灰绿的粉,在草坪上要用浅色才看得见。
-            size = 6 + (int32_t)(12 * percent / 100); color = 0xC9CE9E; break;
+            size = 8 + (int32_t)(14 * percent / 100); color = 0xC9CE9E; break;
         case ZG_FX_LEAK:
-            size = 4; color = COL_HP; break;
+            size = 5; color = COL_HP; break;
         case ZG_FX_SPAWN:
-            size = 10 + (int32_t)(14 * (100 - percent) / 100); color = COL_SPAWN;
+            size = 12 + (int32_t)(18 * (100 - percent) / 100); color = COL_SPAWN;
             ring = true; break;
         case ZG_FX_HURT:
-            size = 8; color = COL_HP; break;
+            size = 10; color = COL_HP; break;
         case ZG_FX_GUNUP:
-            banner = true; break;
+            gun = true; text_only = true; break;
+        case ZG_FX_CLONE:
+            clone = true; text_only = true; break;
+        case ZG_FX_ZLEARN:
+            // 坏消息抢好消息:同一帧里两条横幅都要亮时,先说僵尸学会了。
+            zlearn = true; text_only = true; break;
         case ZG_FX_PICKUP:
             // 接到道具:一圈往外扩的白环,和"打死僵尸的灰绿粉"区分开。
-            size = 8 + (int32_t)(16 * (100 - percent) / 100); color = 0xFFFFFF;
+            size = 10 + (int32_t)(18 * (100 - percent) / 100); color = 0xFFFFFF;
+            ring = true; break;
+        case ZG_FX_ZCLONE:
+            // 分身登场:卡片那一圈紫,和"土色的突袭预警"区分得开。
+            size = 10 + (int32_t)(16 * (100 - percent) / 100);
+            color = zg_item_info(ZG_ITEM_CLONE)->color;
             ring = true; break;
         default:
             break;
@@ -612,17 +690,26 @@ static void render_fx(void)
         lv_obj_set_style_border_width(v->obj, ring ? 2 : 0, 0);
         lv_obj_set_style_border_color(v->obj, lv_color_hex(color), 0);
         lv_obj_set_style_border_opa(v->obj, (lv_opa_t)(fade > 255 ? 255 : fade), 0);
-        set_visible(v->obj, fx->kind != ZG_FX_GUNUP);
-        v->shown = fx->kind != ZG_FX_GUNUP;
+        set_visible(v->obj, !text_only);
+        v->shown = !text_only;
         v->look = (int16_t)fx->kind;
     }
 
-    if (banner) {
-        lv_label_set_text_fmt(s_banner, "%s UP!", zg_weapon_info(s_game.weapon)->name);
-        set_visible(s_banner, true);
-    } else {
-        set_visible(s_banner, false);
+    const int8_t want = zlearn ? 2 : (clone ? 1 : (gun ? 0 : -1));
+    if (want != s_banner_shown) {
+        s_banner_shown = want;
+        if (want == 2) {
+            lv_label_set_text(s_banner, "ZOMBIES CLONE!");
+            lv_obj_set_style_text_color(s_banner, lv_color_hex(COL_HP), 0);
+        } else if (want == 1) {
+            lv_label_set_text(s_banner, "CLONE x3!");
+            lv_obj_set_style_text_color(s_banner, lv_color_hex(COL_GOLD), 0);
+        } else if (want == 0) {
+            lv_label_set_text_fmt(s_banner, "%s UP!", zg_weapon_info(s_game.weapon)->name);
+            lv_obj_set_style_text_color(s_banner, lv_color_hex(COL_GOLD), 0);
+        }
     }
+    set_visible(s_banner, want >= 0);
 }
 
 // 换关的两处可见变化:每一级都亮横幅,第 4/7/10 级再换一档草坪颜色。
@@ -702,8 +789,8 @@ static void render_player(void)
     const uint32_t period = (s_game.hold_ms >= ZG_SPRINT_MS) ? 2u : 4u;
     const bool walk = !s_game.paused && s_game.move_dir != 0 &&
                       ((s_frame % period) < period / 2);
-    lv_obj_set_y(s_leaf_l, walk ? 12 : 13);
-    lv_obj_set_y(s_leaf_r, walk ? 12 : 11);
+    lv_obj_set_y(s_leaf_l, walk ? 19 : 20);
+    lv_obj_set_y(s_leaf_r, walk ? 17 : 18);
 }
 
 static void render_overlays(void)
@@ -735,6 +822,22 @@ static void render_overlays(void)
             set_visible(s_ready_label, true);
             help = true;
             lv_label_set_text(s_footer, "TAP OK TO RESUME");
+        } else if (s_game.zclone_ms > 0) {
+            // 反噬进行中:这一行是坏消息的剩余时间,比"我有几颗豆"更该被看见。
+            lv_label_set_text_fmt(s_footer, "ZOMBIE CLONE  %us LEFT",
+                                  (unsigned)((s_game.zclone_ms + 999u) / 1000u));
+        } else if (s_game.learn_ms > 0) {
+            // 卡片刚到手:同时报"现在多强"和"多久之后怪也会这招",这两件事是一件事。
+            lv_label_set_text_fmt(s_footer, "CLONE x%u  ZOMBIE IN %us",
+                                  (unsigned)s_game.clones,
+                                  (unsigned)((s_game.learn_ms + 999u) / 1000u));
+        } else if (s_game.clones > 0 && s_game.rapid_ms > 0) {
+            lv_label_set_text_fmt(s_footer, "CLONE x%u  FAST %us",
+                                  (unsigned)s_game.clones,
+                                  (unsigned)((s_game.rapid_ms + 999u) / 1000u));
+        } else if (s_game.clones > 0) {
+            lv_label_set_text_fmt(s_footer, "CLONE x%u  PEAS x%u",
+                                  (unsigned)s_game.clones, (unsigned)zg_volley(&s_game));
         } else if (s_game.rapid_ms > 0 && s_game.bonus_shots > 0) {
             lv_label_set_text_fmt(s_footer, "FAST %us  PEAS x%u",
                                   (unsigned)((s_game.rapid_ms + 999u) / 1000u),
@@ -800,6 +903,7 @@ static void render_locked(void)
     s_frame++;
     render_hud();
     render_player();
+    render_clones();
     render_zombies();
     render_bullets();
     render_items();
@@ -966,6 +1070,8 @@ esp_err_t app_zombie_start(void)
     ESP_LOGI(TAG, "游戏就绪:UP=左 DOWN=右(按住 0.5 秒翻倍),OK 长按暂停,每 %ld 分换关共 %d 关,%ld 分通关,历史最高分 %lu",
              (long)ZG_LEVEL_SCORE_STEP, ZG_LEVEL_MAX, (long)ZG_WIN_SCORE,
              (unsigned long)best);
+    ESP_LOGI(TAG, "克隆卡片:接住种下 %d 株克隆豌豆,僵尸 %d 秒后学会复制再持续 %d 秒",
+             ZG_POOL_CLONES, ZG_ZOMBIE_LEARN_MS / 1000, ZG_ZOMBIE_CLONE_MS / 1000);
     return ESP_OK;
 
 fail_page:

@@ -12,6 +12,11 @@
 
 #define TICK_MS 40
 
+// 精灵放大到 24 x 38 之后,射手占据底边 212~250 这一段。把"摆在枪口下挨打"的靶子
+// 统一放在这条线以上,否则僵尸一出生就和射手重叠,测的变成撞人扣血而不是开枪。
+#define RANGE_Y 170
+#define RANGE_X 111   // 使 18px 宽的小僵尸正好横跨在 24px 宽的射手中线上
+
 // 把生成器冻住:每次推进前把两个倒计时都拉满,单条规则测试就不会被随机刷出来的
 // 僵尸或半路掉下来的道具干扰。
 static void step_pure(zg_game_t *g, uint16_t dt)
@@ -157,11 +162,14 @@ static void test_tables_are_consistent(void)
     assert(zg_max_alive(1) == 2);
     // "后面关卡慢慢变多":刷怪更密、同屏更多,而且两个方向都只能单调往前推。
     assert(zg_spawn_interval_ms(ZG_LEVEL_MAX) < zg_spawn_interval_ms(1));
-    assert(zg_max_alive(ZG_LEVEL_MAX) == ZG_POOL_ZOMBIES);
+    // 正常刷怪的上限吃 ZG_SPAWN_CAP,僵尸池尾部那几只名额是留给卡片反噬的分身的。
+    // 如果哪天有人把两者合并,后期接卡片就再也塞不进分身了——缺点变成没有缺点。
+    assert(ZG_POOL_ZOMBIES > ZG_SPAWN_CAP);
+    assert(zg_max_alive(ZG_LEVEL_MAX) == ZG_SPAWN_CAP);
     for (uint8_t lv = 2; lv <= ZG_LEVEL_MAX; lv++) {
         assert(zg_spawn_interval_ms(lv) <= zg_spawn_interval_ms(lv - 1));
         assert(zg_max_alive(lv) >= zg_max_alive(lv - 1));
-        assert(zg_max_alive(lv) <= ZG_POOL_ZOMBIES);
+        assert(zg_max_alive(lv) <= ZG_SPAWN_CAP);
         assert(zg_item_interval_ms(lv) <= zg_item_interval_ms(lv - 1));
     }
     // 换关横幅要够长到能读完两行字,又不能长到吃掉大半关(一关最少也有几十秒)。
@@ -179,6 +187,37 @@ static void test_tables_are_consistent(void)
             assert(zg_item_info((zg_item_kind_t)k)->color != zg_item_info((zg_item_kind_t)j)->color);
         }
     }
+    // 精灵必须比初版大:240x250 的屏上 16x26 的射手几乎是一粒米。这几条下限就是
+    // "人物要看得见"这条需求的凭据,哪天缩回去这里先红,而不是等玩家抱怨。
+    assert(ZG_PLAYER_W >= 24 && ZG_PLAYER_H >= 38);
+    assert(zg_zombie_info(ZG_Z_SMALL)->w >= 18 && zg_zombie_info(ZG_Z_SMALL)->h >= 21);
+    assert(zg_zombie_info(ZG_Z_BIG)->w >= 30 && zg_zombie_info(ZG_Z_BIG)->h >= 30);
+    assert(ZG_BULLET_W >= 4 && ZG_BULLET_H >= 10);
+    assert(ZG_ITEM_SIZE >= 18);
+    // 放大只该动尺寸,不该顺手把怪变硬:小僵尸第 1 关仍然是两下、16 px/s。
+    assert(zg_zombie_hp(ZG_Z_SMALL, 1) == 2);
+    assert(zg_zombie_vy(ZG_Z_SMALL, 1) == 16);
+
+    // 克隆卡片:三株射手站得进场,反噬严格按"10 秒后学会、只持续 20 秒"到账。
+    assert(ZG_POOL_CLONES == 3);
+    assert(ZG_ZOMBIE_LEARN_MS == 10000);
+    assert(ZG_ZOMBIE_CLONE_MS == 20000);
+    assert(ZG_ZOMBIE_CLONE_STEP_MS > ZG_DT_MAX_MS);
+    assert(ZG_CLONE_W >= 16 && ZG_CLONE_H >= 24 && ZG_CLONE_H < ZG_PLAYER_H);
+    assert(ZG_CLONE_DAMAGE == 1);                              // 克隆不该比本体打得疼
+    // 单个克隆不该比本体的枪还勤:卡片是"多几株帮手",不是把主武器换掉。
+    assert(ZG_CLONE_FIRE_MS > zg_weapon_info(ZG_WPN_PEA)->interval_ms);
+    assert(ZG_ZCLONE_HP_DIV >= 2 && ZG_ZCLONE_SCORE_DIV >= 2); // 分身必须是弱化版
+    assert(zg_clone_x(0) >= 0);
+    assert(zg_clone_x(ZG_POOL_CLONES - 1) + ZG_CLONE_W <= ZG_FIELD_W);  // 最右一株不出界
+    assert(zg_clone_y() + ZG_CLONE_H == ZG_FIELD_H);           // 和本体一样贴着底边
+    for (unsigned i = 1; i < ZG_POOL_CLONES; i++) {
+        // 三株各自一列,而且不互相压:叠在一起就等于只有一株在打。
+        assert(zg_clone_x(i) >= zg_clone_x(i - 1) + ZG_CLONE_W);
+    }
+    // 越界下标也不能给出场地外的坐标:UI 是按 0..ZG_POOL_CLONES-1 画的,写错要能兜住。
+    assert(zg_clone_x(ZG_POOL_CLONES) <= ZG_FIELD_W - ZG_CLONE_W);
+
     // 屏上按键卡写的是 "2X SPEED",所以倍率必须是 2,改了倍率就要改文案。
     assert(ZG_SPRINT_MUL == 2);
     assert(ZG_SPRINT_MS > ZG_DT_MAX_MS);   // 门限至少比一帧长,否则第一步就快了
@@ -210,6 +249,10 @@ static void test_init_defaults(void)
     assert(g.item_ms == ZG_ITEM_FIRST_MS);
     assert(g.rapid_ms == 0);
     assert(g.bonus_shots == 0);
+    // 卡片相关的初始状态:没吃到卡片就不该有克隆射手,也不该有反噬倒计时。
+    assert(!g.clone_active && g.clones == 0);
+    assert(g.learn_ms == 0 && g.zclone_ms == 0 && g.zclone_step_ms == 0);
+    for (unsigned i = 0; i < ZG_POOL_CLONES; i++) assert(g.clone_reload_ms[i] == 0);
     assert(zg_volley(&g) == zg_weapon_info(ZG_WPN_PEA)->shots);
     assert(zg_fire_interval_ms(&g) == zg_weapon_info(ZG_WPN_PEA)->interval_ms);
 
@@ -402,7 +445,7 @@ static void test_small_zombie_dies_in_two_rifle_shots(void)
     zg_init(&g, 6, 0);
     to_play(&g);
     // 正对枪口、悬在头顶不动的一只小僵尸:血量就是"打两下"的 2。
-    place(&g, 0, ZG_Z_SMALL, 115, 200, 0, 0);
+    place(&g, 0, ZG_Z_SMALL, RANGE_X, RANGE_Y, 0, 0);
     assert(g.zombies[0].hp == 2);
 
     int hits = 0;
@@ -449,7 +492,7 @@ static void test_scoring_advances_levels_and_guns(void)
         int guard = 0;
         // 小僵尸 100 分一只,所以一关是 10 只;到第 9 关累计已经打了 80 多只。
         while (g.score < want[k].score && guard++ < 200) {
-            place(&g, 0, ZG_Z_SMALL, 115, 200, 0, 0);
+            place(&g, 0, ZG_Z_SMALL, RANGE_X, RANGE_Y, 0, 0);
             assert(shoot_one_dead(&g, 0) >= 0);
         }
         assert(g.score >= want[k].score);
@@ -593,6 +636,7 @@ static void test_ten_hp_three_lives_then_game_over(void)
     assert(g.phase == ZG_PHASE_READY && g.score == 0 && g.hp == ZG_HP_MAX);
     assert(g.lives == ZG_LIVES_MAX && g.level == 1 && g.kills == 0);
     assert(g.weapon == ZG_WPN_PEA);
+    assert(!g.clone_active && g.clones == 0 && g.learn_ms == 0 && g.zclone_ms == 0);
     assert(g.best == 500);                 // 纪录不随重开丢失
     assert(g.best_dirty);                  // 还没写盘的纪录不能因为重开而丢
     for (unsigned i = 0; i < ZG_POOL_ZOMBIES; i++) assert(!g.zombies[i].alive);
@@ -685,7 +729,7 @@ static void test_difficulty_ramps_and_caps(void)
     assert(zg_zombie_hp(ZG_Z_SMALL, ZG_LEVEL_MAX) > zg_zombie_hp(ZG_Z_SMALL, 1));
     assert(zg_spawn_interval_ms(99) >= 1000);  // 最密也是一秒多一只,不会刷成一片
     assert(zg_spawn_interval_ms(99) <= zg_spawn_interval_ms(1));
-    assert(zg_max_alive(99) == ZG_POOL_ZOMBIES);
+    assert(zg_max_alive(99) == ZG_SPAWN_CAP);
     assert(zg_item_interval_ms(99) >= ZG_ITEM_MIN_MS);
 
     zg_game_t g;
@@ -700,11 +744,11 @@ static void test_difficulty_ramps_and_caps(void)
 
     // 打死 9 只小僵尸还在第一关,第 10 只跨线:一关 1000 分、小僵尸 100 分。
     for (int i = 0; i < 9; i++) {
-        place(&g, 0, ZG_Z_SMALL, 115, 200, 0, 0);
+        place(&g, 0, ZG_Z_SMALL, RANGE_X, RANGE_Y, 0, 0);
         assert(shoot_one_dead(&g, 0) >= 0);
     }
     assert(g.score == 9u * ZG_LEVEL_SCORE_STEP / 10u && g.level == 1);
-    place(&g, 0, ZG_Z_SMALL, 115, 200, 0, 0);
+    place(&g, 0, ZG_Z_SMALL, RANGE_X, RANGE_Y, 0, 0);
     assert(shoot_one_dead(&g, 0) >= 0);
     assert(g.score >= ZG_LEVEL_SCORE_STEP && g.level == 2);
     assert(g.weapon == zg_weapon_for_level(2));
@@ -910,8 +954,8 @@ static void test_railgun_pierces_a_column(void)
     assert(g.level == 9 && g.weapon == ZG_WPN_RAILGUN);
 
     // 同一列上前后两只:磁轨枪一发穿透两只。
-    place(&g, 0, ZG_Z_SMALL, 115, 200, 0, 0);
-    place(&g, 1, ZG_Z_SMALL, 115, 210, 0, 0);
+    place(&g, 0, ZG_Z_SMALL, RANGE_X, RANGE_Y, 0, 0);
+    place(&g, 1, ZG_Z_SMALL, RANGE_X, RANGE_Y + 14, 0, 0);
     g.zombies[0].hp = 3;
     g.zombies[1].hp = 3;
     for (int i = 0; i < 200 && (g.zombies[0].alive || g.zombies[1].alive); i++) {
@@ -968,6 +1012,172 @@ static void test_items_are_caught_by_walking(void)
     assert(!g.items[0].alive);
 }
 
+// 本体的枪也一起按住:9999ms 只够 250 帧,长窗口测试里要每帧续上,
+// 否则测着测着本体自己把母体打死了,断言就变成在测运气。
+static void step_frozen(zg_game_t *g)
+{
+    g->reload_ms = 9999;
+    step_pure(g, TICK_MS);
+    g->reload_ms = 9999;
+}
+
+// 克隆卡片的前半段:接住当场种下三株射手,各自从自己的槽位吐豌豆;
+// 再吃一张只是补满位子和重排反噬,不会叠成六株。
+static void test_clone_card_plants_three_shooters(void)
+{
+    zg_game_t g;
+    zg_init(&g, 51, 0);
+    to_play(&g);
+    zg_set_keys(&g, false, false);
+
+    place_item(&g, 0, ZG_ITEM_CLONE, ZG_POS_TO_PX(g.player_x), 60);
+    assert(step_item_gone(&g) > 0);
+    assert(g.clones == ZG_POOL_CLONES && g.clone_active);
+    // 接到卡片那一帧,反噬是从满格起步的(同一帧的 step_card 已经跟着走了一格)。
+    assert(g.learn_ms == ZG_ZOMBIE_LEARN_MS - TICK_MS);
+    assert(g.zclone_ms == 0);
+    // 接到卡片要有一条说得清的横幅,不然玩家只看见草坪上凭空多了三株植物。
+    bool clone_fx = false;
+    for (unsigned i = 0; i < ZG_POOL_FX; i++) {
+        if (g.fx[i].kind == ZG_FX_CLONE) clone_fx = true;
+    }
+    assert(clone_fx);
+
+    // 三株各打各的:弹道起点必须落在引擎那三个槽位的中线上,伤害比本体低一档。
+    g.reload_ms = 9999;                       // 关掉本体,免得分不清哪颗豌豆是谁吐的
+    for (unsigned i = 0; i < ZG_POOL_CLONES; i++) {
+        g.clone_reload_ms[i] = 1;             // 挨个催出膛
+        step_pure(&g, TICK_MS);
+        const int16_t want_x = (int16_t)(zg_clone_x((uint8_t)i) + ZG_CLONE_W / 2 - ZG_BULLET_W / 2);
+        int found = -1;
+        for (unsigned j = 0; j < ZG_POOL_BULLETS; j++) {
+            if (g.bullets[j].alive && ZG_POS_TO_PX(g.bullets[j].x) == want_x) found = (int)j;
+        }
+        assert(found >= 0);
+        assert(g.bullets[found].vy == -ZG_CLONE_SPEED);
+        assert(g.bullets[found].damage == ZG_CLONE_DAMAGE);
+        assert(g.bullets[found].vx == 0);      // 克隆只直上直下,扇形是本体的事
+        assert(g.bullets[found].pierce_left == 0);
+    }
+
+    // 同屏三株就够:再吃一张只把三个位子补满、反噬重新起算。
+    for (int i = 0; i < 25; i++) step_frozen(&g);
+    assert(g.learn_ms < ZG_ZOMBIE_LEARN_MS);
+    place_item(&g, 0, ZG_ITEM_CLONE, ZG_POS_TO_PX(g.player_x), 60);
+    assert(step_item_gone(&g) > 0);
+    assert(g.clones == ZG_POOL_CLONES);        // 不是 6
+    assert(g.learn_ms == ZG_ZOMBIE_LEARN_MS - TICK_MS);  // 第二张把反噬往后推,不叠成两段
+
+    // 丢一条命把整段效果一起收掉:克隆射手没了,还没到账的反噬也不许再来。
+    g.phase = ZG_PHASE_PLAY;
+    g.hp = 1;
+    g.invuln_ms = 0;
+    place(&g, 5, ZG_Z_SMALL, ZG_POS_TO_PX(g.player_x), ZG_FIELD_H - ZG_PLAYER_H, 0, 0);
+    step_pure(&g, TICK_MS);
+    assert(g.lives == ZG_LIVES_MAX - 1);
+    assert(g.clones == 0 && !g.clone_active);
+    assert(g.learn_ms == 0 && g.zclone_ms == 0 && g.zclone_step_ms == 0);
+    for (unsigned i = 0; i < ZG_POOL_CLONES; i++) assert(g.clone_reload_ms[i] == 0);
+
+    // 射手死了就不该再有克隆的豌豆冒出来:三格开火倒计时已清,推进多久都不会再吐。
+    g.phase = ZG_PHASE_PLAY;
+    for (int i = 0; i < ZG_CLONE_FIRE_MS / TICK_MS + 10; i++) {
+        step_frozen(&g);
+        for (unsigned j = 0; j < ZG_POOL_BULLETS; j++) {
+            if (!g.bullets[j].alive) continue;
+            bool from_clone = false;
+            for (unsigned k = 0; k < ZG_POOL_CLONES; k++) {
+                if (ZG_POS_TO_PX(g.bullets[j].x) ==
+                    zg_clone_x((uint8_t)k) + ZG_CLONE_W / 2 - ZG_BULLET_W / 2) from_clone = true;
+            }
+            assert(!from_clone);
+        }
+    }
+}
+
+// 克隆卡片的后半段,也就是这张卡片的"缺点":接住 10 秒之后僵尸才开始复制,
+// 复制只持续 20 秒,每只母体一辈子只生一次,分身血和分都只有母体的一半。
+static void test_zombie_backlash_is_late_and_limited(void)
+{
+    zg_game_t g;
+    zg_init(&g, 52, 0);
+    to_play(&g);
+    zg_set_keys(&g, false, false);
+    place_item(&g, 0, ZG_ITEM_CLONE, ZG_POS_TO_PX(g.player_x), 60);
+    assert(step_item_gone(&g) > 0);
+    g.reload_ms = 9999;
+
+    // 母体放在三株克隆的弹道之外(16/116/216 三条竖线),这样场上谁在挨打只由测试决定。
+    place(&g, 0, ZG_Z_SMALL, 60, 60, 0, 0);
+    g.zombies[0].hp = 6;
+
+    // 从"卡片到账"到"僵尸学会"之间的帧数必须正好是 10 秒。少一秒是白送,多一秒
+    // 是把代价提前;接住卡片那一帧 step_card 已经跟着走掉一格,所以起点少一帧。
+    int frames_to_learn = 0;
+    while (g.zclone_ms == 0 && frames_to_learn < 1000) {
+        step_frozen(&g);
+        assert(!g.zombies[0].cloned);         // 10 秒没到之前一只分身都不许出
+        assert(zg_clone_zombie_count(&g) == 0);
+        frames_to_learn++;
+    }
+    assert(frames_to_learn == ZG_ZOMBIE_LEARN_MS / TICK_MS - 1);
+    assert(g.learn_ms == 0);
+    assert(g.zclone_ms == ZG_ZOMBIE_CLONE_MS);
+    assert(zg_clone_zombie_count(&g) == 0);
+    // 学会的那一刻要有警告横幅:偷偷开始复制等于没告诉玩家这张卡片有代价。
+    bool learn_fx = false;
+    for (unsigned i = 0; i < ZG_POOL_FX; i++) {
+        if (g.fx[i].kind == ZG_FX_ZLEARN) learn_fx = true;
+    }
+    assert(learn_fx);
+
+    step_frozen(&g);                          // 下一帧就放第一只,不多等一个 3 秒步长
+    assert(g.zombies[0].cloned);              // 母体用掉了它这一辈子唯一的一次复制
+    assert(zg_clone_zombie_count(&g) == 1);
+
+    const zg_zombie_t *dup = &g.zombies[1];
+    assert(dup->alive && dup->is_clone && dup->cloned);
+    assert(dup->type == g.zombies[0].type);
+    assert(dup->w == g.zombies[0].w && dup->h == g.zombies[0].h);
+    assert(dup->vy == g.zombies[0].vy);
+    assert(dup->hp == g.zombies[0].hp / ZG_ZCLONE_HP_DIV);   // 血按母体"剩余"的一半算
+    // 分身是错开一只身位出来的,不是和母体重叠成同一只。
+    assert(ZG_POS_TO_PX(dup->x) != ZG_POS_TO_PX(g.zombies[0].x));
+    assert(dup->x >= 0 && dup->x <= ZG_PX_TO_POS(ZG_FIELD_W - dup->w));
+
+    // 复制窗口里每隔 ZG_ZOMBIE_CLONE_STEP_MS 试一次,但只有那一只母体可以生:
+    // 20 秒下来分身数必须一直钉在 1,不然这局就没法收尾了。
+    int window_frames = 1;                    // 上面那一帧就是窗口的第一帧
+    while (g.zclone_ms > 0 && window_frames < 1000) {
+        step_frozen(&g);
+        assert(zg_clone_zombie_count(&g) == 1);
+        assert(g.zombies[1].alive);
+        window_frames++;
+    }
+    assert(window_frames == ZG_ZOMBIE_CLONE_MS / TICK_MS);   // 20 秒整,一秒不多
+    assert(g.zclone_ms == 0);
+    step_frozen(&g);
+    assert(!g.clone_active);                  // 空窗走完的那一帧把这一段账结清
+    assert(g.clones == ZG_POOL_CLONES);       // 反噬到期,自己这边的克隆射手还在
+    assert(g.zombies[1].alive);               // 已经生出来的分身不会随窗口一起消失
+
+    // 分身分值减半:把克隆静音、只留本体的枪,免得说不清这一发是谁打的。
+    g.clones = 0;
+    g.reload_ms = 0;
+    for (unsigned i = 0; i < ZG_POOL_ZOMBIES; i++) {
+        if (i != 1) g.zombies[i].alive = false;
+    }
+    g.player_x = ZG_PX_TO_POS((ZG_FIELD_W - ZG_PLAYER_W) / 2);
+    g.zombies[1].x = ZG_PX_TO_POS(RANGE_X);
+    g.zombies[1].y = ZG_PX_TO_POS(RANGE_Y);
+    g.zombies[1].hp = 1;
+    const uint32_t score_before = g.score;
+    assert(shoot_one_dead(&g, 1) >= 0);
+    assert(g.score == score_before +
+               zg_zombie_info(ZG_Z_SMALL)->score / ZG_ZCLONE_SCORE_DIV);
+    assert(g.kills == 1);                     // 分身也算打死一只,只是不值那么多分
+}
+
 static void test_spawn_pool_and_bounds(void)
 {
     zg_game_t g;
@@ -1002,10 +1212,15 @@ static void test_spawn_pool_and_bounds(void)
             assert(g.level >= zg_zombie_info(z->type)->unlock_level);
             // 预警中的突袭僵尸不移动、也不伤人。
             if (z->telegraph_ms > 0) assert(z->type == ZG_Z_AMBUSH);
+            // 分身自己绝不再当母体:每一只复制出来的怪都必须带着"已经生过"的标记,
+            // 否则 20 秒窗口里会变成指数增长。
+            if (z->is_clone) assert(z->cloned);
         }
         assert(alive <= ZG_POOL_ZOMBIES);
-        // 同屏数量必须守住这一级的上限,不然第 1 关就不再是"要少"。
-        assert(alive <= zg_max_alive(g.level));
+        // 同屏数量必须守住这一级的上限,不然第 1 关就不再是"要少"。这条按"非分身"算:
+        // 卡片反噬复制出来的分身只吃僵尸池尾部那几只余量,不该把上限一起顶掉,
+        // 否则第 1 关接了卡片就能刷出一整屏怪。
+        assert(alive - zg_clone_zombie_count(&g) <= zg_max_alive(g.level));
         assert(zg_alive_count(&g) == alive);
         for (unsigned j = 0; j < ZG_POOL_BULLETS; j++) {
             if (!g.bullets[j].alive) continue;
@@ -1047,6 +1262,8 @@ static uint32_t checksum(const zg_game_t *g)
         (uint32_t)g->player_x, (uint32_t)g->invuln_ms, (uint32_t)g->reload_ms,
         (uint32_t)g->ready_ms, (uint32_t)g->levelup_ms, (uint32_t)g->spawn_ms,
         (uint32_t)g->item_ms, (uint32_t)g->rapid_ms, (uint32_t)g->bonus_shots,
+        (uint32_t)g->clone_active, (uint32_t)g->clones, (uint32_t)g->learn_ms,
+        (uint32_t)g->zclone_ms, (uint32_t)g->clone_reload_ms[0],
         (uint32_t)g->move_dir, (uint32_t)g->hold_ms, g->rng,
     };
     for (unsigned i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
@@ -1056,7 +1273,8 @@ static uint32_t checksum(const zg_game_t *g)
         const zg_zombie_t *z = &g->zombies[i];
         h = (h ^ (uint32_t)z->alive ^ ((uint32_t)z->x << 3) ^ ((uint32_t)z->y << 5) ^
              ((uint32_t)z->hp << 7) ^ ((uint32_t)z->type << 11) ^
-             ((uint32_t)z->airborne << 13) ^ ((uint32_t)z->telegraph_ms << 17)) * 16777619u;
+             ((uint32_t)z->airborne << 13) ^ ((uint32_t)z->telegraph_ms << 17) ^
+             ((uint32_t)z->is_clone << 23) ^ ((uint32_t)z->cloned << 24)) * 16777619u;
     }
     for (unsigned i = 0; i < ZG_POOL_BULLETS; i++) {
         const zg_bullet_t *b = &g->bullets[i];
@@ -1127,6 +1345,8 @@ int main(void)
     test_items_are_caught_by_walking();
     test_clearing_all_levels_wins();
     test_railgun_pierces_a_column();
+    test_clone_card_plants_three_shooters();
+    test_zombie_backlash_is_late_and_limited();
     test_spawn_pool_and_bounds();
     test_same_seed_same_round();
     puts("zombie shooter engine tests: PASS");
