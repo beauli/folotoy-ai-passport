@@ -25,8 +25,10 @@ CONFIG_LV_DEF_REFR_PERIOD=20
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
 # LVGL 内置 malloc 池大小(KB)。它是独立静态区、不与系统堆共享,配大了会白白占用 RAM。
-# 本 demo UI 简单,24KB 足够;若自建复杂界面出现绘制卡死/看门狗,调大此值。
-CONFIG_LV_MEM_SIZE_KILOBYTES=24
+# 参考示例的菜单 UI 简单,24KB 就够;豌豆射手这局界面一次要建约 80 个对象
+# (6 只僵尸各一组部件 + 10 颗豌豆 + 8 个特效 + HUD),按 24KB 走会把池子吃到边上,
+# 所以留到 32KB。开机日志里会打 "LVGL 堆:已用/峰值/共",照着它调。
+CONFIG_LV_MEM_SIZE_KILOBYTES=32
 
 # --- 系统 ---
 CONFIG_FREERTOS_HZ=1000
